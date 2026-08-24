@@ -1595,6 +1595,8 @@ dependencies = [
  "num-traits",
  "png",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -3089,6 +3091,7 @@ dependencies = [
  "axum",
  "eframe",
  "http-body-util",
+ "image",
  "local-ip-address",
  "openh264",
  "rand",

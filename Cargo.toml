@@ -26,6 +26,7 @@ eframe = { version = "0.36", default-features = false, features = [
     "default_fonts",
     "glow",
 ] }
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
 openh264 = { version = "0.9", features = ["source"] }
 windows-capture = "2.0"
 

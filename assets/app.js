@@ -6,13 +6,18 @@ const loginError = document.querySelector("#login-error");
 const canvas = document.querySelector("#screen");
 const status = document.querySelector("#status");
 const fullscreenButton = document.querySelector("#fullscreen");
+const modeNote = document.querySelector("#mode-note");
 const context = canvas.getContext("2d", { alpha: false, desynchronized: true });
+const hasWebCodecs = "VideoDecoder" in window && "EncodedVideoChunk" in window;
+const streamFormat = hasWebCodecs ? "h264" : "jpeg";
 
 let decoder;
 let socket;
 let reconnectTimer;
 let token = sessionStorage.getItem("tesla-screen-token") || "";
 let consecutiveConnectFailures = 0;
+let pendingJpeg = null;
+let jpegDecodeRunning = false;
 
 function showStatus(message, connected = false) {
   status.textContent = message;
@@ -64,30 +69,91 @@ function configureDecoder(codec) {
 
 function parseFrame(data) {
   const view = new DataView(data);
-  if (data.byteLength < 25 || view.getUint32(0) !== 0x42575331) return null;
+  if (data.byteLength < 25) return null;
+  const magic = view.getUint32(0);
+  const format = magic === 0x54535331 ? "h264" : magic === 0x5453534a ? "jpeg" : null;
+  if (!format) return null;
   const width = view.getUint32(4);
   const height = view.getUint32(8);
-  const timestamp = Number(view.getBigUint64(12));
+  const timestamp = view.getUint32(12) * 4294967296 + view.getUint32(16);
   const keyframe = view.getUint8(20) === 1;
   const length = view.getUint32(21);
   if (25 + length !== data.byteLength) return null;
-  return { width, height, timestamp, keyframe, bytes: new Uint8Array(data, 25, length) };
+  return { format, width, height, timestamp, keyframe, bytes: new Uint8Array(data, 25, length) };
+}
+
+function sizeCanvas(width, height) {
+  if (canvas.width !== width || canvas.height !== height) {
+    canvas.width = width;
+    canvas.height = height;
+  }
+}
+
+async function drawJpeg(bytes) {
+  const blob = new Blob([bytes], { type: "image/jpeg" });
+  if ("createImageBitmap" in window) {
+    const bitmap = await createImageBitmap(blob);
+    sizeCanvas(bitmap.width, bitmap.height);
+    context.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    bitmap.close();
+    return;
+  }
+
+  await new Promise((resolve, reject) => {
+    const objectUrl = URL.createObjectURL(blob);
+    const image = new Image();
+    image.onload = () => {
+      sizeCanvas(image.naturalWidth, image.naturalHeight);
+      context.drawImage(image, 0, 0, canvas.width, canvas.height);
+      URL.revokeObjectURL(objectUrl);
+      resolve();
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(objectUrl);
+      reject(new Error("JPEG decode failed"));
+    };
+    image.src = objectUrl;
+  });
+}
+
+function queueJpeg(bytes) {
+  pendingJpeg = bytes.slice();
+  if (jpegDecodeRunning) return;
+  jpegDecodeRunning = true;
+  (async () => {
+    while (pendingJpeg) {
+      const nextJpeg = pendingJpeg;
+      pendingJpeg = null;
+      try {
+        await drawJpeg(nextJpeg);
+        showStatus("Verbunden (HTTP-Kompatibilitätsmodus)", true);
+      } catch (error) {
+        console.error("JPEG frame decode failed", error);
+        showStatus("JPEG-Frame konnte nicht angezeigt werden …");
+      }
+    }
+    jpegDecodeRunning = false;
+  })();
 }
 
 function connect() {
   clearTimeout(reconnectTimer);
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  socket = new WebSocket(`${scheme}://${location.host}/ws?token=${encodeURIComponent(token)}`);
+  socket = new WebSocket(`${scheme}://${location.host}/ws?token=${encodeURIComponent(token)}&format=${streamFormat}`);
   socket.binaryType = "arraybuffer";
   let opened = false;
   socket.onopen = () => {
     opened = true;
     consecutiveConnectFailures = 0;
-    showStatus("Warte auf den ersten Frame …");
+    showStatus(streamFormat === "jpeg" ? "Warte auf den HTTP-Kompatibilitätsstream …" : "Warte auf den ersten Frame …");
   };
   socket.onmessage = (event) => {
     const frame = parseFrame(event.data);
     if (!frame) return;
+    if (frame.format === "jpeg") {
+      queueJpeg(frame.bytes);
+      return;
+    }
     if (frame.keyframe && (!decoder || decoder.state === "closed")) {
       configureDecoder(extractCodecFromAnnexB(frame.bytes));
     }
@@ -152,10 +218,12 @@ fullscreenButton.addEventListener("click", async () => {
   }
 });
 
-if (!("VideoDecoder" in window)) {
-  loginError.textContent = "Dieser Browser unterstützt WebCodecs nicht.";
-  loginForm.querySelector("button").disabled = true;
-} else if (token) {
+if (!hasWebCodecs) {
+  modeNote.hidden = false;
+  modeNote.textContent = "HTTP-Kompatibilitätsmodus aktiv. Der Stream funktioniert ohne WebCodecs und ohne HTTPS-Zertifikat.";
+}
+
+if (token) {
   login.hidden = true;
   viewer.hidden = false;
   connect();

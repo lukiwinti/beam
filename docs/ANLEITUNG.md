@@ -9,7 +9,7 @@ Windows-Bildschirm
   → Windows Graphics Capture
   → OpenH264 Baseline (Annex B)
   → eingebetteter WebSocket-Server
-  → WebCodecs + Canvas im Tesla-Browser
+  → WebCodecs/H.264 oder HTTP-JPEG-Fallback + Canvas im Tesla-Browser
 ```
 
 Alle Bestandteile laufen in `tesla-screen-sender.exe`. Ein echter Monitor und ein HDMI-Dummy-/Display-Emulator werden von Windows gleich behandelt, solange der Bildschirm in den Windows-Anzeigeeinstellungen aktiv ist.
@@ -18,7 +18,7 @@ Alle Bestandteile laufen in `tesla-screen-sender.exe`. Ein echter Monitor und ei
 
 - Windows 10 oder Windows 11
 - Tesla und Windows-PC am selben Router/WLAN
-- Ein Browser mit WebCodecs-Unterstützung
+- Ein aktueller Browser; bei HTTP wird automatisch der JPEG-Kompatibilitätsmodus verwendet
 - Für den Selbstbau: aktuelle Rust-MSVC-Toolchain und Visual Studio Build Tools mit „Desktopentwicklung mit C++“
 
 ## Anwendung bauen
@@ -49,6 +49,10 @@ Die EXE enthält auch HTML, CSS und JavaScript der Tesla-Empfängerseite. Es mü
 7. Die in der App angezeigte Adresse, beispielsweise `http://192.168.10.177:8080`, im Tesla-Browser öffnen.
 8. Die PIN aus der Windows-App eingeben und „Stream öffnen“ drücken.
 9. Optional über die Schaltfläche oben rechts in den Browser-Vollbildmodus wechseln.
+
+### Hinweis zu HTTP und WebCodecs
+
+Browser stellen `VideoDecoder` nur in einem sicheren HTTPS-Kontext oder für `localhost` bereit. Eine über `http://192.168.…` geöffnete Seite kann WebCodecs daher unabhängig vom verwendeten Browser nicht sehen. Die Anwendung erkennt das automatisch und wechselt auf einen JPEG-Stream, der ohne Zertifikat über die lokale IP funktioniert. Bei einem späteren Betrieb über vertrauenswürdiges HTTPS wird automatisch wieder der effizientere H.264-/WebCodecs-Pfad benutzt.
 
 ## Netzwerk
 

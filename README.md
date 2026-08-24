@@ -9,7 +9,7 @@ Die Anwendung enthält alles in einem Prozess:
 - H.264-Encoding mit OpenH264
 - lokalen HTTP-/WebSocket-Server
 - PIN-Anmeldung
-- touchfreundliche Tesla-Empfängerseite mit WebCodecs und Canvas
+- touchfreundliche Tesla-Empfängerseite mit WebCodecs und automatischem HTTP-JPEG-Fallback
 - automatische Wiederverbindung nach kurzen WLAN-Unterbrechungen
 
 ## Release bauen
@@ -45,3 +45,5 @@ Die ausführliche Anleitung steht unter [docs/ANLEITUNG.md](docs/ANLEITUNG.md).
 ## Aktueller Umfang
 
 Diese Version überträgt das Bild. Audio sowie Touch-/Tastatursteuerung von Windows sind noch nicht enthalten.
+
+Beim Aufruf über eine normale lokale HTTP-IP verwendet die Seite automatisch den JPEG-Kompatibilitätsmodus. WebCodecs steht laut Browserstandard nur in sicheren HTTPS-Kontexten oder auf `localhost` zur Verfügung. Eine Zertifikats- oder DNS-Einrichtung ist für den JPEG-Modus nicht erforderlich.

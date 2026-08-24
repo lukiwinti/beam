@@ -1,5 +1,6 @@
-use crate::server::{EncodedFrame, StreamState};
+use crate::server::{EncodedFrame, StreamFormat, StreamState};
 use anyhow::{Context as _, Result, anyhow};
+use image::{ExtendedColorType, codecs::jpeg::JpegEncoder};
 use openh264::{
     OpenH264API,
     encoder::{
@@ -34,9 +35,12 @@ struct ScreenCapture {
     encoder: Encoder,
     yuv: Option<YUVBuffer>,
     scratch: Vec<u8>,
+    jpeg_rgb: Vec<u8>,
     started_at: Instant,
     last_encoded_at: Option<Instant>,
+    last_jpeg_at: Option<Instant>,
     frame_interval: Duration,
+    jpeg_interval: Duration,
 }
 
 impl GraphicsCaptureApiHandler for ScreenCapture {
@@ -63,9 +67,12 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             encoder,
             yuv: None,
             scratch: Vec::new(),
+            jpeg_rgb: Vec::new(),
             started_at: Instant::now(),
             last_encoded_at: None,
+            last_jpeg_at: None,
             frame_interval: Duration::from_secs_f64(1.0 / f64::from(context.flags.fps)),
+            jpeg_interval: Duration::from_secs_f64(1.0 / f64::from(context.flags.fps.min(20))),
         })
     }
 
@@ -104,6 +111,42 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         };
         let bgra = buffer.as_nopadding_buffer(&mut self.scratch);
         let dimensions = (width as usize, height as usize);
+
+        let timestamp_us = self
+            .started_at
+            .elapsed()
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        if self.state.needs_jpeg_frames()
+            && self
+                .last_jpeg_at
+                .is_none_or(|last| now.duration_since(last) >= self.jpeg_interval)
+        {
+            let pixel_count = dimensions.0.saturating_mul(dimensions.1);
+            self.jpeg_rgb.resize(pixel_count.saturating_mul(3), 0);
+            let (source_pixels, _) = bgra.as_chunks::<4>();
+            let (destination_pixels, _) = self.jpeg_rgb.as_chunks_mut::<3>();
+            for (source, destination) in source_pixels.iter().zip(destination_pixels.iter_mut()) {
+                destination[0] = source[2];
+                destination[1] = source[1];
+                destination[2] = source[0];
+            }
+
+            let mut jpeg = Vec::new();
+            JpegEncoder::new_with_quality(&mut jpeg, 72)
+                .encode(&self.jpeg_rgb, width, height, ExtendedColorType::Rgb8)
+                .context("Bildschirmframe konnte nicht als JPEG kodiert werden")?;
+            self.state.publish(EncodedFrame {
+                format: StreamFormat::Jpeg,
+                width,
+                height,
+                timestamp_us,
+                keyframe: true,
+                data: jpeg,
+            });
+            self.last_jpeg_at = Some(now);
+        }
+
         let source = BgraSliceU8::new(bgra, dimensions);
 
         let yuv = self
@@ -130,13 +173,10 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         }
 
         self.state.publish(EncodedFrame {
+            format: StreamFormat::H264,
             width,
             height,
-            timestamp_us: self
-                .started_at
-                .elapsed()
-                .as_micros()
-                .min(u128::from(u64::MAX)) as u64,
+            timestamp_us,
             keyframe: matches!(frame_type, FrameType::IDR | FrameType::I),
             data,
         });

@@ -221,6 +221,12 @@ impl eframe::App for SenderApp {
                     "{} Browser verbunden · {} Frames · {} × {}",
                     snapshot.clients, snapshot.frames, snapshot.width, snapshot.height
                 ));
+                if snapshot.jpeg_clients > 0 {
+                    ui.small(format!(
+                        "{} Browser im HTTP-Kompatibilitätsmodus (JPEG)",
+                        snapshot.jpeg_clients
+                    ));
+                }
                 ui.small("Tesla, Smartphone und dieser PC müssen mit demselben Router/WLAN verbunden sein.");
             }
 
