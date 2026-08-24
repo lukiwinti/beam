@@ -309,6 +309,13 @@ fn run_lego(request: &AcmeRequest) -> Result<()> {
             .arg(request.email.trim())
             .arg("--dns")
             .arg(&request.provider)
+            // lego's automatic fallback includes Cloudflare IPv6 resolvers. On
+            // IPv4-only vehicle networks that makes an otherwise successful
+            // DNS-01 challenge fail during the local propagation check.
+            .arg("--dns.resolvers")
+            .arg("1.1.1.1:53")
+            .arg("--dns.resolvers")
+            .arg("1.0.0.1:53")
             .arg("--domains")
             .arg(request.domain.trim())
             .arg("--cert.name")
