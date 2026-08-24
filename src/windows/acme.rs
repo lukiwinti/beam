@@ -316,6 +316,11 @@ fn run_lego(request: &AcmeRequest) -> Result<()> {
             .arg("1.1.1.1:53")
             .arg("--dns.resolvers")
             .arg("1.0.0.1:53")
+            // Recursive resolvers can cache NXDOMAIN for the challenge name
+            // before Hetzner publishes the short-lived TXT record. Validate
+            // against the authoritative nameservers instead; Let's Encrypt
+            // still performs its own independent public DNS validation.
+            .arg("--dns.propagation.disable-rns")
             .arg("--domains")
             .arg(request.domain.trim())
             .arg("--cert.name")

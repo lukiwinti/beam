@@ -78,7 +78,7 @@ Browser stellen `VideoDecoder` nur in einem sicheren HTTPS-Kontext oder für `lo
 9. **Stream starten**. Beim ersten Mal wird der geprüfte ACME-Client heruntergeladen, `_acme-challenge.<domain>` kurzzeitig über die Hetzner-API gesetzt und anschließend das Zertifikat angefordert. Das kann je nach DNS-Propagation einige Minuten dauern; die GUI bleibt dabei bedienbar.
 10. Danach die angezeigte Adresse, beispielsweise `https://tesla.example.de:8080`, im Tesla öffnen.
 
-Für die lokale DNS-Propagationsprüfung verwendet die Anwendung ausdrücklich die IPv4-Resolver `1.1.1.1` und `1.0.0.1`. Dadurch schlägt die DNS-01-Challenge in reinen IPv4-Netzen nicht fehl, nur weil ein automatisch ausgewählter öffentlicher IPv6-Resolver unerreichbar ist. Der HTTPS-Dienst selbst muss für DNS-01 zu keinem Zeitpunkt aus dem Internet erreichbar sein.
+Für die Ermittlung der DNS-Zone verwendet die Anwendung ausdrücklich die IPv4-Resolver `1.1.1.1` und `1.0.0.1`. Die eigentliche lokale Propagationsprüfung erfolgt direkt gegen die autoritativen Hetzner-Nameserver. Rekursive Resolver werden dafür nicht verwendet, weil sie einen zuvor nicht vorhandenen Challenge-Namen als `NXDOMAIN` zwischenspeichern können. Der HTTPS-Dienst selbst muss für DNS-01 zu keinem Zeitpunkt aus dem Internet erreichbar sein.
 
 Die Anwendung prüft das Zertifikat alle zwölf Stunden. `lego` erneuert es 30 Tage vor Ablauf; anschließend wird das neue Zertifikat ohne Streamneustart geladen. Falls eine Erneuerung vorübergehend fehlschlägt, läuft das vorhandene gültige Zertifikat weiter und beim nächsten Intervall erfolgt ein neuer Versuch.
 
