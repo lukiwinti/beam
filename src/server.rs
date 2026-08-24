@@ -334,12 +334,17 @@ async fn stream_socket(
         return;
     }
 
+    let mut waiting_for_keyframe = false;
     loop {
         match frames.recv().await {
             Ok(frame) => {
                 if frame.format != format {
                     continue;
                 }
+                if waiting_for_keyframe && !frame.keyframe {
+                    continue;
+                }
+                waiting_for_keyframe = false;
                 if socket
                     .send(Message::Binary(frame.to_wire().into()))
                     .await
@@ -348,7 +353,9 @@ async fn stream_socket(
                     break;
                 }
             }
-            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Lagged(_)) => {
+                waiting_for_keyframe = format == StreamFormat::H264;
+            }
             Err(broadcast::error::RecvError::Closed) => break,
         }
     }

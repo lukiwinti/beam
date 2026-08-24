@@ -18,6 +18,10 @@ let token = sessionStorage.getItem("tesla-screen-token") || "";
 let consecutiveConnectFailures = 0;
 let pendingJpeg = null;
 let jpegDecodeRunning = false;
+let pendingVideoFrame = null;
+let videoPaintScheduled = false;
+let waitingForKeyframe = true;
+const MAX_DECODE_QUEUE = 4;
 
 function showStatus(message, connected = false) {
   status.textContent = message;
@@ -46,17 +50,14 @@ function configureDecoder(codec) {
   if (decoder && decoder.state !== "closed") decoder.close();
   decoder = new VideoDecoder({
     output(frame) {
-      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
-        canvas.width = frame.displayWidth;
-        canvas.height = frame.displayHeight;
-      }
-      context.drawImage(frame, 0, 0, canvas.width, canvas.height);
-      frame.close();
-      showStatus("Verbunden", true);
+      if (pendingVideoFrame) pendingVideoFrame.close();
+      pendingVideoFrame = frame;
+      scheduleVideoPaint();
     },
     error(error) {
       console.error("Decoder error", error);
       decoder = null;
+      waitingForKeyframe = true;
       showStatus("Decoder wartet auf ein neues Schlüsselbild …");
     },
   });
@@ -116,6 +117,22 @@ async function drawJpeg(bytes) {
   });
 }
 
+function scheduleVideoPaint() {
+  if (videoPaintScheduled) return;
+  videoPaintScheduled = true;
+  requestAnimationFrame(() => {
+    videoPaintScheduled = false;
+    const frame = pendingVideoFrame;
+    pendingVideoFrame = null;
+    if (!frame) return;
+    sizeCanvas(frame.displayWidth, frame.displayHeight);
+    context.drawImage(frame, 0, 0, canvas.width, canvas.height);
+    frame.close();
+    showStatus("Verbunden", true);
+    if (pendingVideoFrame) scheduleVideoPaint();
+  });
+}
+
 function queueJpeg(bytes) {
   pendingJpeg = bytes.slice();
   if (jpegDecodeRunning) return;
@@ -154,11 +171,21 @@ function connect() {
       queueJpeg(frame.bytes);
       return;
     }
+    if (waitingForKeyframe && !frame.keyframe) return;
     if (frame.keyframe && (!decoder || decoder.state === "closed")) {
       configureDecoder(extractCodecFromAnnexB(frame.bytes));
     }
     if (!decoder || decoder.state !== "configured") return;
     try {
+      if (decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
+        decoder.reset();
+        waitingForKeyframe = !frame.keyframe;
+        if (waitingForKeyframe) {
+          showStatus("Bildpuffer wird für Echtzeit geleert …");
+          return;
+        }
+      }
+      waitingForKeyframe = false;
       decoder.decode(new EncodedVideoChunk({
         type: frame.keyframe ? "key" : "delta",
         timestamp: frame.timestamp,

@@ -37,9 +37,7 @@ struct ScreenCapture {
     scratch: Vec<u8>,
     jpeg_rgb: Vec<u8>,
     started_at: Instant,
-    last_encoded_at: Option<Instant>,
     last_jpeg_at: Option<Instant>,
-    frame_interval: Duration,
     jpeg_interval: Duration,
 }
 
@@ -53,12 +51,13 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
                 context.flags.bitrate_kbps.saturating_mul(1_000),
             ))
             .max_frame_rate(FrameRate::from_hz(context.flags.fps as f32))
-            .usage_type(UsageType::ScreenContentRealTime)
+            .usage_type(UsageType::CameraVideoRealTime)
             .rate_control_mode(RateControlMode::Bitrate)
             .profile(Profile::Baseline)
             .complexity(Complexity::Low)
-            .skip_frames(true)
-            .intra_frame_period(IntraFramePeriod::from_num_frames(context.flags.fps * 2));
+            .skip_frames(false)
+            .background_detection(false)
+            .intra_frame_period(IntraFramePeriod::from_num_frames(context.flags.fps));
         let encoder = Encoder::with_api_config(OpenH264API::from_source(), config)
             .context("OpenH264-Encoder konnte nicht initialisiert werden")?;
 
@@ -69,9 +68,7 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             scratch: Vec::new(),
             jpeg_rgb: Vec::new(),
             started_at: Instant::now(),
-            last_encoded_at: None,
             last_jpeg_at: None,
-            frame_interval: Duration::from_secs_f64(1.0 / f64::from(context.flags.fps)),
             jpeg_interval: Duration::from_secs_f64(1.0 / f64::from(context.flags.fps.min(20))),
         })
     }
@@ -82,12 +79,6 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
         _capture_control: InternalCaptureControl,
     ) -> Result<()> {
         let now = Instant::now();
-        if self
-            .last_encoded_at
-            .is_some_and(|last| now.duration_since(last) < self.frame_interval)
-        {
-            return Ok(());
-        }
 
         let width = frame.width() & !1;
         let height = frame.height() & !1;
@@ -163,7 +154,6 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             .context("Bildschirmframe konnte nicht H.264-kodiert werden")?;
         let frame_type = encoded.frame_type();
         if frame_type == FrameType::Skip || frame_type == FrameType::Invalid {
-            self.last_encoded_at = Some(now);
             return Ok(());
         }
         let mut data = Vec::new();
@@ -180,7 +170,6 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             keyframe: matches!(frame_type, FrameType::IDR | FrameType::I),
             data,
         });
-        self.last_encoded_at = Some(now);
         Ok(())
     }
 }

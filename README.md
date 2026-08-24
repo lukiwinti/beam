@@ -11,6 +11,7 @@ Die Anwendung enthält alles in einem Prozess:
 - PIN-Anmeldung
 - touchfreundliche Tesla-Empfängerseite mit WebCodecs und automatischem HTTP-JPEG-Fallback
 - automatische Wiederverbindung nach kurzen WLAN-Unterbrechungen
+- für Vollbewegung optimierter H.264-Pfad ohne encoderseitiges Frame-Skipping oder wachsenden Browserpuffer
 
 ## Release bauen
 
@@ -47,3 +48,5 @@ Die ausführliche Anleitung steht unter [docs/ANLEITUNG.md](docs/ANLEITUNG.md).
 Diese Version überträgt das Bild. Audio sowie Touch-/Tastatursteuerung von Windows sind noch nicht enthalten.
 
 Beim Aufruf über eine normale lokale HTTP-IP verwendet die Seite automatisch den JPEG-Kompatibilitätsmodus. WebCodecs steht laut Browserstandard nur in sicheren HTTPS-Kontexten oder auf `localhost` zur Verfügung. Eine Zertifikats- oder DNS-Einrichtung ist für den JPEG-Modus nicht erforderlich.
+
+Für Video über den nativen HTTPS-/WebCodecs-Modus sind bei 1920×1080 zunächst `30 FPS` und `8000–12000 kbit/s` empfehlenswert. Der Empfänger hält immer das aktuellste Bild; wenn Netzwerk oder Decoder kurzzeitig nicht nachkommen, wird am nächsten Schlüsselbild live resynchronisiert, statt alte Frames verzögert abzuspielen.

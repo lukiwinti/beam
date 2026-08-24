@@ -54,6 +54,10 @@ Die EXE enthält auch HTML, CSS und JavaScript der Tesla-Empfängerseite. Es mü
 
 Browser stellen `VideoDecoder` nur in einem sicheren HTTPS-Kontext oder für `localhost` bereit. Eine über `http://192.168.…` geöffnete Seite kann WebCodecs daher unabhängig vom verwendeten Browser nicht sehen. Die Anwendung erkennt das automatisch und wechselt auf einen JPEG-Stream, der ohne Zertifikat über die lokale IP funktioniert. Bei einem späteren Betrieb über vertrauenswürdiges HTTPS wird automatisch wieder der effizientere H.264-/WebCodecs-Pfad benutzt.
 
+### Einstellungen für Video
+
+Für YouTube und andere Inhalte mit viel Bewegung sind bei einem 1920×1080-Bildschirm `30 FPS` und `8000–12000 kbit/s` ein guter Ausgangspunkt. Der native H.264-Pfad lässt keine Frames mehr zur Einhaltung einer starren Bitrate aus. Aufnahme und Browser arbeiten als Echtzeitpipeline: Bei einer kurzen Überlastung wird am nächsten Schlüsselbild resynchronisiert, anstatt einen immer älter werdenden Bildpuffer abzuarbeiten.
+
 ## Netzwerk
 
 Die App bindet standardmäßig an `0.0.0.0` und ist damit über alle Netzwerkschnittstellen des PCs erreichbar. Es wird nur der konfigurierte TCP-Port benötigt. DNS ist nicht erforderlich; im Tesla wird die angezeigte IPv4-Adresse direkt geöffnet.
