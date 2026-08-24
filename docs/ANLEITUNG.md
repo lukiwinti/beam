@@ -113,7 +113,9 @@ Wenn die Seite nicht erreichbar ist:
 
 ## Verhalten bei Unterbrechungen
 
-Der Browser verbindet den WebSocket nach einer kurzen WLAN-Unterbrechung automatisch neu. Der Server hält das letzte H.264-Schlüsselbild vor, sodass ein neu verbundener Browser unmittelbar in den laufenden Stream einsteigen kann. Nach drei fehlgeschlagenen Verbindungsversuchen wird eine alte Browsersitzung verworfen und die PIN erneut abgefragt.
+Der Browser versucht nach jeder WLAN- oder Serverunterbrechung zeitlich unbegrenzt, den WebSocket erneut aufzubauen. Der erste Versuch erfolgt sofort; bei anhaltender Störung steigt die Wartezeit kurz an und bleibt anschließend bei maximal zwei Sekunden. Der Server hält das letzte H.264-Schlüsselbild vor, sodass ein neu verbundener Browser unmittelbar in den laufenden Stream einsteigen kann.
+
+Wurde die PIN seit dem Öffnen der Seite bereits eingegeben, kann die Seite nach einem Neustart der Windows-App selbstständig ein neues Sitzungstoken anfordern. Nach einem vollständigen Neuladen der Seite bleibt nur das Sitzungstoken erhalten; falls dieses durch einen Serverneustart ungültig wurde, erscheint das PIN-Feld wieder. Die Wiederverbindungsversuche laufen auch dann im Hintergrund endlos weiter.
 
 ## Grenzen der ersten Version
 

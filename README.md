@@ -11,7 +11,7 @@ Die Anwendung enthält alles in einem Prozess:
 - lokalen HTTP-/WebSocket-Server
 - PIN-Anmeldung
 - touchfreundliche Tesla-Empfängerseite mit WebCodecs und automatischem HTTP-JPEG-Fallback
-- automatische Wiederverbindung nach kurzen WLAN-Unterbrechungen
+- zeitlich unbegrenzte automatische Wiederverbindung nach WLAN- und Serverunterbrechungen
 - für Vollbewegung optimierter H.264-Pfad ohne encoderseitiges Frame-Skipping oder wachsenden Browserpuffer
 - persistentes Einstellungsfenster; Speicherung unter `%LOCALAPPDATA%\TeslaScreenSender\settings.json`
 - optionalen HTTPS-Betrieb mit automatischer DNS-01-Challenge und Zertifikatserneuerung

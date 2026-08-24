@@ -16,18 +16,22 @@ let decoder;
 let socket;
 let reconnectTimer;
 let token = sessionStorage.getItem("tesla-screen-token") || "";
-let consecutiveConnectFailures = 0;
+let reconnectAttempts = 0;
+let rememberedPin = "";
 let pendingJpeg = null;
 let jpegDecodeRunning = false;
-let pendingVideoFrame = null;
+let videoFrameQueue = [];
 let videoPaintScheduled = false;
+let videoPaintTimer = null;
 let waitingForKeyframe = true;
 const MAX_DECODE_QUEUE = 4;
+const MAX_SYNCED_VIDEO_FRAMES = 12;
 const MEDIA_LATENCY_SECONDS = 0.15;
 let audioContext = null;
 let audioAnchorTimestamp = null;
 let audioAnchorTime = 0;
 let nextAudioTime = 0;
+const scheduledAudioSources = new Set();
 
 function showStatus(message, connected = false) {
   status.textContent = message;
@@ -54,16 +58,22 @@ function extractCodecFromAnnexB(payload) {
 
 function configureDecoder(codec) {
   if (decoder && decoder.state !== "closed") decoder.close();
+  clearVideoFrames();
   decoder = new VideoDecoder({
     output(frame) {
-      if (pendingVideoFrame) pendingVideoFrame.close();
-      pendingVideoFrame = frame;
+      const audioSyncActive = audioContext?.state === "running" && audioAnchorTimestamp !== null;
+      if (!audioSyncActive) clearVideoFrames();
+      videoFrameQueue.push(frame);
+      while (videoFrameQueue.length > MAX_SYNCED_VIDEO_FRAMES) {
+        videoFrameQueue.shift().close();
+      }
       scheduleVideoPaint();
     },
     error(error) {
       console.error("Decoder error", error);
       decoder = null;
       waitingForKeyframe = true;
+      clearVideoFrames();
       showStatus("Decoder wartet auf ein neues Schlüsselbild …");
     },
   });
@@ -123,34 +133,71 @@ async function drawJpeg(bytes) {
   });
 }
 
+function clearVideoFrames() {
+  for (const frame of videoFrameQueue) frame.close();
+  videoFrameQueue = [];
+  if (videoPaintTimer !== null) {
+    clearTimeout(videoPaintTimer);
+    videoPaintTimer = null;
+  }
+}
+
+function frameTargetTime(frame) {
+  return audioAnchorTime + (frame.timestamp - audioAnchorTimestamp) / 1_000_000;
+}
+
 function scheduleVideoPaint() {
-  if (videoPaintScheduled) return;
+  if (videoPaintScheduled || videoPaintTimer !== null) return;
   videoPaintScheduled = true;
   requestAnimationFrame(() => {
     videoPaintScheduled = false;
-    const frame = pendingVideoFrame;
-    if (!frame) return;
+    if (videoFrameQueue.length === 0) return;
     if (audioContext?.state === "running" && audioAnchorTimestamp !== null) {
-      const targetTime = audioAnchorTime + (frame.timestamp - audioAnchorTimestamp) / 1_000_000;
+      while (
+        videoFrameQueue.length > 1 &&
+        frameTargetTime(videoFrameQueue[0]) < audioContext.currentTime - 0.08
+      ) {
+        videoFrameQueue.shift().close();
+      }
+      const targetTime = frameTargetTime(videoFrameQueue[0]);
       const delay = targetTime - audioContext.currentTime;
-      if (delay > 0.025) {
-        setTimeout(scheduleVideoPaint, Math.min(50, Math.max(4, delay * 1000 - 8)));
+      if (delay > 0.012) {
+        videoPaintTimer = setTimeout(() => {
+          videoPaintTimer = null;
+          scheduleVideoPaint();
+        }, Math.min(50, Math.max(2, delay * 1000 - 5)));
         return;
       }
+    } else {
+      while (videoFrameQueue.length > 1) videoFrameQueue.shift().close();
     }
-    pendingVideoFrame = null;
+    const frame = videoFrameQueue.shift();
     sizeCanvas(frame.displayWidth, frame.displayHeight);
     context.drawImage(frame, 0, 0, canvas.width, canvas.height);
     frame.close();
     showStatus("Verbunden", true);
-    if (pendingVideoFrame) scheduleVideoPaint();
+    if (videoFrameQueue.length > 0) scheduleVideoPaint();
   });
 }
 
+function stopScheduledAudio() {
+  for (const source of scheduledAudioSources) {
+    try {
+      source.stop();
+    } catch {
+      // The source may already have finished between iteration and stop().
+    }
+  }
+  scheduledAudioSources.clear();
+}
+
 function resetMediaClock() {
+  stopScheduledAudio();
   audioAnchorTimestamp = null;
   audioAnchorTime = 0;
   nextAudioTime = 0;
+  pendingJpeg = null;
+  clearVideoFrames();
 }
 
 async function ensureAudioContext() {
@@ -188,6 +235,7 @@ function queueAudio(frame) {
   }
   let scheduledTime = audioAnchorTime + (frame.timestamp - audioAnchorTimestamp) / 1_000_000;
   if (scheduledTime < now - 0.05 || scheduledTime > now + 1) {
+    stopScheduledAudio();
     audioAnchorTimestamp = frame.timestamp;
     audioAnchorTime = now + MEDIA_LATENCY_SECONDS;
     nextAudioTime = audioAnchorTime;
@@ -206,6 +254,8 @@ function queueAudio(frame) {
   const source = audioContext.createBufferSource();
   source.buffer = audioBuffer;
   source.connect(audioContext.destination);
+  source.onended = () => scheduledAudioSources.delete(source);
+  scheduledAudioSources.add(source);
   source.start(scheduledTime);
   nextAudioTime = scheduledTime + frameCount / sampleRate;
 }
@@ -243,16 +293,25 @@ function queueJpeg(frame) {
 
 function connect() {
   clearTimeout(reconnectTimer);
+  if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
+    socket.onclose = null;
+    socket.close();
+  }
   const scheme = location.protocol === "https:" ? "wss" : "ws";
-  socket = new WebSocket(`${scheme}://${location.host}/ws?token=${encodeURIComponent(token)}&format=${streamFormat}`);
-  socket.binaryType = "arraybuffer";
+  const currentSocket = new WebSocket(`${scheme}://${location.host}/ws?token=${encodeURIComponent(token)}&format=${streamFormat}`);
+  socket = currentSocket;
+  currentSocket.binaryType = "arraybuffer";
   let opened = false;
-  socket.onopen = () => {
+  currentSocket.onopen = () => {
+    if (socket !== currentSocket) return;
     opened = true;
-    consecutiveConnectFailures = 0;
+    reconnectAttempts = 0;
+    login.hidden = true;
+    viewer.hidden = false;
     showStatus(streamFormat === "jpeg" ? "Warte auf den HTTP-Kompatibilitätsstream …" : "Warte auf den ersten Frame …");
   };
-  socket.onmessage = (event) => {
+  currentSocket.onmessage = (event) => {
+    if (socket !== currentSocket) return;
     const frame = parseFrame(event.data);
     if (!frame) return;
     if (frame.format === "pcm") {
@@ -271,6 +330,7 @@ function connect() {
     try {
       if (decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
         decoder.reset();
+        clearVideoFrames();
         waitingForKeyframe = !frame.keyframe;
         if (waitingForKeyframe) {
           showStatus("Bildpuffer wird für Echtzeit geleert …");
@@ -287,22 +347,50 @@ function connect() {
       console.error("Frame decode failed", error);
     }
   };
-  socket.onclose = (event) => {
+  currentSocket.onclose = (event) => {
+    if (socket !== currentSocket) return;
     resetMediaClock();
-    if (!opened) consecutiveConnectFailures += 1;
-    if (event.code === 1008 || event.code === 1002 || consecutiveConnectFailures >= 3) {
-      sessionStorage.removeItem("tesla-screen-token");
-      token = "";
-      consecutiveConnectFailures = 0;
-      viewer.hidden = true;
+    if (decoder && decoder.state !== "closed") decoder.close();
+    decoder = null;
+    waitingForKeyframe = true;
+    if (!opened) reconnectAttempts += 1;
+
+    const shouldRefreshToken = event.code === 1008 || (reconnectAttempts >= 3 && reconnectAttempts % 3 === 0);
+    if (shouldRefreshToken && rememberedPin) {
+      void requestToken(rememberedPin)
+        .then(() => {
+          if (socket !== currentSocket) return;
+          reconnectAttempts = 0;
+          connect();
+        })
+        .catch(() => {
+          // The server may still be offline. The scheduled reconnect keeps running.
+        });
+    } else if (shouldRefreshToken && !rememberedPin) {
       login.hidden = false;
-      loginError.textContent = "Sitzung abgelaufen. Bitte erneut anmelden.";
-      return;
+      loginError.textContent = "Verbindung unterbrochen. Erneut anmelden oder auf die automatische Wiederverbindung warten.";
     }
-    showStatus("Verbindung unterbrochen – neuer Versuch …");
-    reconnectTimer = setTimeout(connect, 1200);
+
+    const delay = reconnectAttempts === 0
+      ? 0
+      : Math.min(2_000, 200 * Math.pow(1.35, Math.min(reconnectAttempts - 1, 10)));
+    showStatus(`Verbindung unterbrochen – neuer Versuch${delay > 0 ? ` in ${Math.ceil(delay)} ms` : " sofort"} …`);
+    reconnectTimer = setTimeout(connect, delay);
   };
-  socket.onerror = () => socket.close();
+  currentSocket.onerror = () => currentSocket.close();
+}
+
+async function requestToken(pin) {
+  const response = await fetch("/api/login", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ pin }),
+  });
+  if (!response.ok) throw new Error("invalid credentials");
+  const payload = await response.json();
+  token = payload.token;
+  rememberedPin = pin;
+  sessionStorage.setItem("tesla-screen-token", token);
 }
 
 loginForm.addEventListener("submit", async (event) => {
@@ -310,18 +398,10 @@ loginForm.addEventListener("submit", async (event) => {
   void ensureAudioContext();
   loginError.textContent = "";
   try {
-    const response = await fetch("/api/login", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ pin: pinInput.value }),
-    });
-    if (!response.ok) throw new Error("invalid credentials");
-    const payload = await response.json();
-    token = payload.token;
-    sessionStorage.setItem("tesla-screen-token", token);
+    await requestToken(pinInput.value);
     login.hidden = true;
     viewer.hidden = false;
-    consecutiveConnectFailures = 0;
+    reconnectAttempts = 0;
     connect();
   } catch {
     loginError.textContent = "Ungültige PIN";
