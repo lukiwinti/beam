@@ -4,6 +4,17 @@ GPU-accelerated remote desktop for Linux, streaming to any browser via WebCodecs
 
 Fully open source, GPU-accelerated, sub-30ms latency. Built for developers who want to access their Linux workstation from any browser.
 
+## Standalone Windows Sender
+
+The workspace also contains a separate Windows desktop application that captures a selected physical or HDMI-dummy monitor and serves it directly to a browser on the local network. It includes its own GUI, PIN login, HTTP/WebSocket server, H.264 encoder, and touch-friendly receiver page; it does **not** require the Beam Linux server.
+
+```powershell
+cargo build --release -p beam-windows-sender
+.\target\release\beam-windows-sender.exe
+```
+
+See [docs/windows-sender-de.md](docs/windows-sender-de.md) for the complete German setup and usage guide. The first version streams video only; audio and browser-side input control are not included.
+
 <!-- TODO: Add screenshot or demo GIF here showing a desktop session with performance overlay (F9) -->
 <!-- ![Beam desktop session](docs/screenshot.png) -->
 

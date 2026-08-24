@@ -1,5 +1,10 @@
 [workspace]
-members = ["crates/server", "crates/agent", "crates/protocol"]
+members = [
+    "crates/server",
+    "crates/agent",
+    "crates/protocol",
+    "crates/windows-sender",
+]
 resolver = "2"
 
 [workspace.package]

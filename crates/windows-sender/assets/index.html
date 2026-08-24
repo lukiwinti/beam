@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="de">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+    <meta name="theme-color" content="#05070a" />
+    <title>Beam Windows Sender</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main id="login" class="overlay">
+      <form id="login-form" class="card">
+        <p class="eyebrow">BEAM WINDOWS</p>
+        <h1>Bildschirm verbinden</h1>
+        <p class="hint">PIN aus der Windows-App eingeben.</p>
+        <label for="pin">PIN</label>
+        <input id="pin" name="pin" type="password" inputmode="text" autocomplete="current-password" required autofocus />
+        <button type="submit">Stream öffnen</button>
+        <p id="login-error" class="error" role="alert"></p>
+      </form>
+    </main>
+
+    <section id="viewer" hidden>
+      <canvas id="screen"></canvas>
+      <div id="status" class="status">Verbindung wird hergestellt …</div>
+      <button id="fullscreen" class="fullscreen" type="button" aria-label="Vollbild">⛶</button>
+    </section>
+
+    <script src="/app.js" defer></script>
+  </body>
+</html>
