@@ -15,6 +15,8 @@ Die Anwendung enthält alles in einem Prozess:
 - für Vollbewegung optimierter H.264-Pfad ohne encoderseitiges Frame-Skipping oder wachsenden Browserpuffer
 - persistentes Einstellungsfenster; Speicherung unter `%LOCALAPPDATA%\TeslaScreenSender\settings.json`
 - optionalen HTTPS-Betrieb mit automatischer DNS-01-Challenge und Zertifikatserneuerung
+- automatische HTTP-zu-HTTPS-Umleitung auf demselben Port für alte Browser-Lesezeichen
+- Anzeige der tatsächlich kodierten Bildrate zusätzlich zur eingestellten Obergrenze
 
 ## Release bauen
 

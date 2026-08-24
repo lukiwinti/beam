@@ -103,6 +103,8 @@ Die App bindet standardmäßig an `0.0.0.0` und ist damit über alle Netzwerksch
 
 Im HTTP-Modus sind PIN und Videostream nicht verschlüsselt. Den HTTP-Port nicht ins Internet weiterleiten und diesen Modus nur in einem vertrauenswürdigen Fahrzeug-/Heimnetz verwenden. Im HTTPS-Modus werden Seite, Anmeldung, WebSocket, Bild und Ton TLS-verschlüsselt übertragen.
 
+Ist HTTPS aktiviert, akzeptiert derselbe Port auch einen versehentlichen Aufruf mit `http://` und leitet ihn unmittelbar auf `https://` um. Dadurch funktionieren alte Tesla-Lesezeichen weiter, ohne mit „Invalid HTTP response“ an einem reinen TLS-Port zu scheitern.
+
 Wenn die Seite nicht erreichbar ist:
 
 1. Prüfen, ob Tesla und PC IP-Adressen im gleichen Subnetz besitzen.
@@ -120,6 +122,7 @@ Wurde die PIN seit dem Öffnen der Seite bereits eingegeben, kann die Seite nach
 ## Grenzen der ersten Version
 
 - Der Browser ist nur Empfänger. Touch-, Maus- und Tastatureingaben werden nicht zurück an Windows gesendet.
+- Der FPS-Wert ist die gewünschte Obergrenze. Die Hauptansicht zeigt zusätzlich die tatsächlich kodierte Bildrate. Sie hängt vom Monitortakt, der Bildrate des Quellvideos und der CPU-Leistung ab. Bei 60 FPS verwendet die Aufnahme direkt den nativen Displaytakt, um ein Unterschwingen durch den Windows-Aufnahmetimer zu vermeiden.
 - OpenH264 kodiert in dieser Version per CPU. 4K bei hoher Bildrate kann deshalb je nach Laptop zu langsam sein. Für 1920×1080 sind 30 FPS ein sinnvoller Startpunkt.
 - OpenH264 unterstützt maximal 3840×2160 im Querformat beziehungsweise 2160×3840 im Hochformat.
 - Die PIN gilt bis zum Stoppen des Streams. Beim nächsten Start wird eine neue Serversitzung mit neuem internem Zugriffstoken erzeugt.

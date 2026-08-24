@@ -37,6 +37,9 @@ pub struct SenderApp {
     pending_start: Option<mpsc::Receiver<anyhow::Result<PreparedCertificate>>>,
     message: Option<(bool, String)>,
     show_settings: bool,
+    fps_sample_at: Instant,
+    fps_sample_frames: u64,
+    measured_fps: f64,
 }
 
 impl SenderApp {
@@ -58,6 +61,9 @@ impl SenderApp {
             pending_start: None,
             message: None,
             show_settings: false,
+            fps_sample_at: Instant::now(),
+            fps_sample_frames: 0,
+            measured_fps: 0.0,
         };
         app.refresh_displays();
         if let Some(error) = load_error {
@@ -217,6 +223,9 @@ impl SenderApp {
             state,
             url: url.clone(),
         });
+        self.fps_sample_at = Instant::now();
+        self.fps_sample_frames = 0;
+        self.measured_fps = 0.0;
         self.message = Some((true, format!("Stream läuft unter {url}")));
     }
 
@@ -475,6 +484,20 @@ impl eframe::App for SenderApp {
             self.message = Some((false, message));
         }
 
+        if let Some(running) = &self.running {
+            let now = Instant::now();
+            let elapsed = now.duration_since(self.fps_sample_at);
+            if elapsed >= Duration::from_millis(500) {
+                let frames = running.state.snapshot().frames;
+                self.measured_fps =
+                    frames.saturating_sub(self.fps_sample_frames) as f64 / elapsed.as_secs_f64();
+                self.fps_sample_frames = frames;
+                self.fps_sample_at = now;
+            }
+        } else {
+            self.measured_fps = 0.0;
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("Tesla Screen Sender");
@@ -501,7 +524,7 @@ impl eframe::App for SenderApp {
                 .unwrap_or_else(|| "Kein Bildschirm".to_owned());
             ui.label(format!("Bildschirm: {selected_monitor}"));
             ui.label(format!(
-                "{} FPS · {} kbit/s · Ton {} · {}",
+                "max. {} FPS · {} kbit/s · Ton {} · {}",
                 self.config.fps,
                 self.config.bitrate_kbps,
                 if self.config.audio_enabled { "an" } else { "aus" },
@@ -542,8 +565,9 @@ impl eframe::App for SenderApp {
                 ui.label(format!("PIN: {}", self.config.pin));
                 let snapshot = running.state.snapshot();
                 ui.label(format!(
-                    "{} Browser verbunden · {} Frames · {} Audiopakete · {} × {}",
+                    "{} Browser verbunden · {:.1} FPS tatsächlich · {} Frames · {} Audiopakete · {} × {}",
                     snapshot.clients,
+                    self.measured_fps,
                     snapshot.frames,
                     snapshot.audio_packets,
                     snapshot.width,

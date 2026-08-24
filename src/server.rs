@@ -5,6 +5,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use axum_server_dual_protocol::ServerExt as _;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -215,17 +216,13 @@ impl LocalServer {
                             let _ = shutdown_rx.await;
                             shutdown_handle.graceful_shutdown(Some(Duration::from_secs(3)));
                         });
-                        let server = match axum_server::from_tcp_rustls(listener, config.clone()) {
-                            Ok(server) => server,
-                            Err(error) => {
-                                let _ = ready_tx.send(Err(format!(
-                                    "HTTPS-Listener konnte nicht vorbereitet werden: {error}"
-                                )));
-                                return;
-                            }
-                        };
+                        let server = axum_server_dual_protocol::from_tcp_dual_protocol(
+                            listener,
+                            config.clone(),
+                        );
                         let _ = ready_tx.send(Ok(Some(config.clone())));
                         if let Err(error) = server
+                            .set_upgrade(true)
                             .handle(handle)
                             .serve(app.into_make_service_with_connect_info::<SocketAddr>())
                             .await
@@ -652,15 +649,24 @@ mod tests {
             }),
         )
         .unwrap();
-        let response = reqwest::blocking::Client::builder()
+        let client = reqwest::blocking::Client::builder()
             .danger_accept_invalid_certs(true)
             .build()
-            .unwrap()
+            .unwrap();
+        let response = client
             .get(format!("https://localhost:{}/", server.address.port()))
             .send()
             .unwrap();
         assert!(response.status().is_success());
         assert!(response.text().unwrap().contains("Tesla Screen"));
+
+        let redirected = client
+            .get(format!("http://localhost:{}/", server.address.port()))
+            .send()
+            .unwrap();
+        assert!(redirected.status().is_success());
+        assert_eq!(redirected.url().scheme(), "https");
+        assert!(redirected.text().unwrap().contains("Tesla Screen"));
         server.stop();
         std::fs::remove_dir_all(directory).unwrap();
     }

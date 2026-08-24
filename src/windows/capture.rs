@@ -201,7 +201,13 @@ impl CaptureSession {
             },
             DrawBorderSettings::WithoutBorder,
             SecondaryWindowSettings::Default,
-            MinimumUpdateIntervalSettings::Custom(Duration::from_secs_f64(1.0 / f64::from(fps))),
+            if fps == 60 {
+                // At the maximum setting, let the compositor deliver at the monitor's native
+                // cadence. A custom 16.67-ms Windows throttle can undershoot a 60-Hz display.
+                MinimumUpdateIntervalSettings::Default
+            } else {
+                MinimumUpdateIntervalSettings::Custom(Duration::from_secs_f64(1.0 / f64::from(fps)))
+            },
             DirtyRegionSettings::Default,
             ColorFormat::Bgra8,
             CaptureFlags {
