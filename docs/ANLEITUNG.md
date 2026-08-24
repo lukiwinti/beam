@@ -1,6 +1,6 @@
 # Eigenständiger Windows-Sender für den Tesla-Browser
 
-Der Windows-Sender ist eine einzelne Desktop-Anwendung. Er nimmt einen ausgewählten Windows-Bildschirm auf, kodiert das Bild als H.264 und stellt die Empfängerseite über einen eingebauten HTTP-/WebSocket-Server bereit. DNS und ein Internetzugang werden dafür nicht benötigt.
+Der Windows-Sender ist eine einzelne Desktop-Anwendung. Er nimmt einen ausgewählten Windows-Bildschirm sowie den Windows-Systemton auf, kodiert das Bild als H.264 und stellt die Empfängerseite über einen eingebauten HTTP-/WebSocket-Server bereit. DNS und ein Internetzugang werden dafür nicht benötigt.
 
 ## Aufbau
 
@@ -10,6 +10,11 @@ Windows-Bildschirm
   → OpenH264 Baseline (Annex B)
   → eingebetteter WebSocket-Server
   → WebCodecs/H.264 oder HTTP-JPEG-Fallback + Canvas im Tesla-Browser
+
+Windows-Standardausgabegerät
+  → WASAPI Loopback (48 kHz, Stereo)
+  → derselbe WebSocket und dieselbe Zeitbasis wie das Bild
+  → Web Audio im Tesla-Browser
 ```
 
 Alle Bestandteile laufen in `tesla-screen-sender.exe`. Ein echter Monitor und ein HDMI-Dummy-/Display-Emulator werden von Windows gleich behandelt, solange der Bildschirm in den Windows-Anzeigeeinstellungen aktiv ist.
@@ -41,8 +46,8 @@ Die EXE enthält auch HTML, CSS und JavaScript der Tesla-Empfängerseite. Es mü
 ## Erster Start
 
 1. `build\release\tesla-screen-sender.exe` starten.
-2. Den gewünschten Bildschirm wählen. Falls ein HDMI-Dummy erst später angeschlossen wurde, „Neu laden“ drücken.
-3. Port, Bildrate und Bitrate einstellen. Für den ersten Test sind `8080`, `30 FPS` und `8000 kbit/s` sinnvoll.
+2. „Einstellungen“ öffnen und den gewünschten Bildschirm wählen. Falls ein HDMI-Dummy erst später angeschlossen wurde, „Neu laden“ drücken.
+3. Port, Bildrate und Bitrate einstellen. Für den ersten Test sind `8080`, `30 FPS` und `8000 kbit/s` sinnvoll. „Systemton übertragen“ aktiviert lassen.
 4. Die voreingestellte PIN `123456` vor der Nutzung ändern.
 5. „Stream starten“ drücken.
 6. Falls Windows Defender Firewall fragt, den Zugriff im **privaten Netzwerk** erlauben. Keine Freigabe für öffentliche Netzwerke ist nötig.
@@ -50,9 +55,41 @@ Die EXE enthält auch HTML, CSS und JavaScript der Tesla-Empfängerseite. Es mü
 8. Die PIN aus der Windows-App eingeben und „Stream öffnen“ drücken.
 9. Optional über die Schaltfläche oben rechts in den Browser-Vollbildmodus wechseln.
 
+Die Einstellungen bleiben nach dem Beenden erhalten. Die Anwendung speichert sie unter `%LOCALAPPDATA%\TeslaScreenSender\settings.json` und lädt sie beim nächsten Start automatisch. Browser blockieren automatische Audiowiedergabe teilweise bis zur ersten Benutzergeste. Falls kein Ton hörbar ist, im Stream einmal die Schaltfläche `🔊` antippen.
+
+### Ton und Synchronisation
+
+Die Anwendung nimmt das Windows-Standardausgabegerät per WASAPI-Loopback mit 48 kHz in Stereo auf. Bild und Ton erhalten Zeitstempel aus derselben Uhr. Im Empfänger ist Audio die Referenz: Videoframes werden gegen die geplante Audiowiedergabe angezeigt, anstatt Ton und Bild mit zwei voneinander driftenden Timern abzuspielen. Wird das Windows-Standardausgabegerät während eines laufenden Streams gewechselt, den Stream einmal stoppen und neu starten.
+
 ### Hinweis zu HTTP und WebCodecs
 
 Browser stellen `VideoDecoder` nur in einem sicheren HTTPS-Kontext oder für `localhost` bereit. Eine über `http://192.168.…` geöffnete Seite kann WebCodecs daher unabhängig vom verwendeten Browser nicht sehen. Die Anwendung erkennt das automatisch und wechselt auf einen JPEG-Stream, der ohne Zertifikat über die lokale IP funktioniert. Bei einem späteren Betrieb über vertrauenswürdiges HTTPS wird automatisch wieder der effizientere H.264-/WebCodecs-Pfad benutzt.
+
+### HTTPS mit Hetzner DNS einrichten
+
+1. Einen Hostnamen festlegen, beispielsweise `tesla.example.de`.
+2. Sicherstellen, dass dieser Hostname im WLAN des Fahrzeugs auf die lokale IP des Windows-PCs auflöst. Das kann über den DNS-Server des Routers, einen lokalen DNS-Server oder einen passenden öffentlichen A-/AAAA-Eintrag erfolgen.
+3. In der Hetzner Console das Projekt öffnen, in dem die DNS-Zone liegt.
+4. Unter **Security → API Tokens** einen neuen Token mit Lese-/Schreibzugriff erzeugen und sofort kopieren. Ein reiner Read-only-Token kann den temporären TXT-Eintrag nicht anlegen. Bei migrierten DNS-Zonen muss ein Token aus der neuen Hetzner Console verwendet werden; alte Tokens aus der früheren DNS Console funktionieren mit der neuen API nicht.
+5. In Tesla Screen Sender **Einstellungen → HTTPS und Let's Encrypt** öffnen.
+6. HTTPS aktivieren, den Hostnamen ohne `https://` und ohne Port sowie eine gültige E-Mail-Adresse eintragen.
+7. Als DNS-Provider **Hetzner** auswählen und den Token in **API-Token** einfügen.
+8. Die Let's-Encrypt-Nutzungsbedingungen akzeptieren und die Einstellungen speichern.
+9. **Stream starten**. Beim ersten Mal wird der geprüfte ACME-Client heruntergeladen, `_acme-challenge.<domain>` kurzzeitig über die Hetzner-API gesetzt und anschließend das Zertifikat angefordert. Das kann je nach DNS-Propagation einige Minuten dauern; die GUI bleibt dabei bedienbar.
+10. Danach die angezeigte Adresse, beispielsweise `https://tesla.example.de:8080`, im Tesla öffnen.
+
+Die Anwendung prüft das Zertifikat alle zwölf Stunden. `lego` erneuert es 30 Tage vor Ablauf; anschließend wird das neue Zertifikat ohne Streamneustart geladen. Falls eine Erneuerung vorübergehend fehlschlägt, läuft das vorhandene gültige Zertifikat weiter und beim nächsten Intervall erfolgt ein neuer Versuch.
+
+Direkt auswählbar sind außerdem Cloudflare, IONOS, Netcup, DigitalOcean, Duck DNS, deSEC.io, http.net, IPv64 und Vercel. Jeder Provider zeigt nur die für ihn benötigten Zugangsfelder an. Die zugrunde liegende Registry ist vom Server getrennt und kann um weitere der von `lego` angebotenen DNS-Provider erweitert werden.
+
+### Speicherorte
+
+- Allgemeine Einstellungen: `%LOCALAPPDATA%\TeslaScreenSender\settings.json`
+- Mit Windows DPAPI verschlüsselte DNS-Zugangsdaten: `%LOCALAPPDATA%\TeslaScreenSender\acme-credentials.dpapi`
+- ACME-Konto und Zertifikate: `%LOCALAPPDATA%\TeslaScreenSender\acme`
+- Geprüfter ACME-Client: `%LOCALAPPDATA%\TeslaScreenSender\tools`
+
+Die API-Zugangsdaten sind dadurch an den aktuellen Windows-Benutzer und denselben Computer gebunden. Das Kopieren der `.dpapi`-Datei auf einen anderen PC liefert keinen lesbaren API-Schlüssel.
 
 ### Einstellungen für Video
 
@@ -62,7 +99,7 @@ Für YouTube und andere Inhalte mit viel Bewegung sind bei einem 1920×1080-Bild
 
 Die App bindet standardmäßig an `0.0.0.0` und ist damit über alle Netzwerkschnittstellen des PCs erreichbar. Es wird nur der konfigurierte TCP-Port benötigt. DNS ist nicht erforderlich; im Tesla wird die angezeigte IPv4-Adresse direkt geöffnet.
 
-Die Verbindung nutzt im lokalen Netz absichtlich HTTP. PIN und Videostream sind daher nicht verschlüsselt. Den Port nicht ins Internet weiterleiten und die Anwendung nur in einem vertrauenswürdigen Fahrzeug-/Heimnetz verwenden. Für nicht vertrauenswürdige Netze wäre ein vorgeschaltetes HTTPS-Konzept nötig.
+Im HTTP-Modus sind PIN und Videostream nicht verschlüsselt. Den HTTP-Port nicht ins Internet weiterleiten und diesen Modus nur in einem vertrauenswürdigen Fahrzeug-/Heimnetz verwenden. Im HTTPS-Modus werden Seite, Anmeldung, WebSocket, Bild und Ton TLS-verschlüsselt übertragen.
 
 Wenn die Seite nicht erreichbar ist:
 
@@ -78,7 +115,6 @@ Der Browser verbindet den WebSocket nach einer kurzen WLAN-Unterbrechung automat
 
 ## Grenzen der ersten Version
 
-- Es wird nur das Bild übertragen; Systemton ist noch nicht enthalten.
 - Der Browser ist nur Empfänger. Touch-, Maus- und Tastatureingaben werden nicht zurück an Windows gesendet.
 - OpenH264 kodiert in dieser Version per CPU. 4K bei hoher Bildrate kann deshalb je nach Laptop zu langsam sein. Für 1920×1080 sind 30 FPS ein sinnvoller Startpunkt.
 - OpenH264 unterstützt maximal 3840×2160 im Querformat beziehungsweise 2160×3840 im Hochformat.

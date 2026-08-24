@@ -9,11 +9,14 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::{
     net::{SocketAddr, TcpListener},
+    path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        mpsc,
     },
     thread,
+    time::Duration,
 };
 use tokio::sync::{broadcast, oneshot};
 
@@ -26,6 +29,7 @@ const FRAME_HEADER_LEN: usize = 25;
 pub enum StreamFormat {
     H264,
     Jpeg,
+    AudioPcm,
 }
 
 impl StreamFormat {
@@ -33,6 +37,7 @@ impl StreamFormat {
         match self {
             Self::H264 => b"TSS1",
             Self::Jpeg => b"TSSJ",
+            Self::AudioPcm => b"TSSA",
         }
     }
 }
@@ -66,6 +71,7 @@ pub struct StreamSnapshot {
     pub clients: usize,
     pub jpeg_clients: usize,
     pub frames: u64,
+    pub audio_packets: u64,
     pub width: u32,
     pub height: u32,
 }
@@ -79,13 +85,14 @@ pub struct StreamState {
     clients: AtomicUsize,
     jpeg_clients: AtomicUsize,
     frames: AtomicU64,
+    audio_packets: AtomicU64,
     width: AtomicU32,
     height: AtomicU32,
 }
 
 impl StreamState {
     pub fn new(pin: String) -> Arc<Self> {
-        let (frame_tx, _) = broadcast::channel(16);
+        let (frame_tx, _) = broadcast::channel(64);
         let token = format!("{:032x}", rand::rng().random::<u128>());
         Arc::new(Self {
             frame_tx,
@@ -96,16 +103,26 @@ impl StreamState {
             clients: AtomicUsize::new(0),
             jpeg_clients: AtomicUsize::new(0),
             frames: AtomicU64::new(0),
+            audio_packets: AtomicU64::new(0),
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
         })
     }
 
     pub fn publish(&self, frame: EncodedFrame) {
-        self.width.store(frame.width, Ordering::Relaxed);
-        self.height.store(frame.height, Ordering::Relaxed);
-        if frame.format == StreamFormat::H264 {
-            self.frames.fetch_add(1, Ordering::Relaxed);
+        match frame.format {
+            StreamFormat::H264 => {
+                self.width.store(frame.width, Ordering::Relaxed);
+                self.height.store(frame.height, Ordering::Relaxed);
+                self.frames.fetch_add(1, Ordering::Relaxed);
+            }
+            StreamFormat::Jpeg => {
+                self.width.store(frame.width, Ordering::Relaxed);
+                self.height.store(frame.height, Ordering::Relaxed);
+            }
+            StreamFormat::AudioPcm => {
+                self.audio_packets.fetch_add(1, Ordering::Relaxed);
+            }
         }
         let frame = Arc::new(frame);
         match frame.format {
@@ -117,6 +134,7 @@ impl StreamState {
                 *self.latest_jpeg.lock().expect("JPEG frame lock poisoned") =
                     Some(Arc::clone(&frame));
             }
+            StreamFormat::AudioPcm => {}
             StreamFormat::H264 => {}
         }
         let _ = self.frame_tx.send(frame);
@@ -131,6 +149,7 @@ impl StreamState {
             clients: self.clients.load(Ordering::Relaxed),
             jpeg_clients: self.jpeg_clients.load(Ordering::Relaxed),
             frames: self.frames.load(Ordering::Relaxed),
+            audio_packets: self.audio_packets.load(Ordering::Relaxed),
             width: self.width.load(Ordering::Relaxed),
             height: self.height.load(Ordering::Relaxed),
         }
@@ -145,14 +164,26 @@ pub struct LocalServer {
     shutdown_tx: Option<oneshot::Sender<()>>,
     thread: Option<thread::JoinHandle<()>>,
     pub address: SocketAddr,
+    tls_config: Option<axum_server::tls_rustls::RustlsConfig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TlsIdentity {
+    pub cert_path: PathBuf,
+    pub key_path: PathBuf,
 }
 
 impl LocalServer {
-    pub fn start(address: SocketAddr, state: Arc<StreamState>) -> anyhow::Result<Self> {
+    pub fn start(
+        address: SocketAddr,
+        state: Arc<StreamState>,
+        tls: Option<TlsIdentity>,
+    ) -> anyhow::Result<Self> {
         let listener = TcpListener::bind(address)?;
         listener.set_nonblocking(true)?;
         let actual_address = listener.local_addr()?;
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread = thread::Builder::new()
             .name("tesla-screen-local-web".to_owned())
             .spawn(move || {
@@ -162,27 +193,85 @@ impl LocalServer {
                     .build()
                     .expect("failed to create local web runtime");
                 runtime.block_on(async move {
-                    let listener = tokio::net::TcpListener::from_std(listener)
-                        .expect("failed to convert TCP listener");
                     let app = router(state);
-                    if let Err(error) = axum::serve(
-                        listener,
-                        app.into_make_service_with_connect_info::<SocketAddr>(),
-                    )
-                    .with_graceful_shutdown(async move {
-                        let _ = shutdown_rx.await;
-                    })
-                    .await
-                    {
-                        tracing::error!(%error, "local sender web server stopped");
+                    if let Some(identity) = tls {
+                        let config = match axum_server::tls_rustls::RustlsConfig::from_pem_file(
+                            &identity.cert_path,
+                            &identity.key_path,
+                        )
+                        .await
+                        {
+                            Ok(config) => config,
+                            Err(error) => {
+                                let _ = ready_tx.send(Err(format!(
+                                    "TLS-Zertifikat konnte nicht geladen werden: {error}"
+                                )));
+                                return;
+                            }
+                        };
+                        let handle = axum_server::Handle::new();
+                        let shutdown_handle = handle.clone();
+                        tokio::spawn(async move {
+                            let _ = shutdown_rx.await;
+                            shutdown_handle.graceful_shutdown(Some(Duration::from_secs(3)));
+                        });
+                        let server = match axum_server::from_tcp_rustls(listener, config.clone()) {
+                            Ok(server) => server,
+                            Err(error) => {
+                                let _ = ready_tx.send(Err(format!(
+                                    "HTTPS-Listener konnte nicht vorbereitet werden: {error}"
+                                )));
+                                return;
+                            }
+                        };
+                        let _ = ready_tx.send(Ok(Some(config.clone())));
+                        if let Err(error) = server
+                            .handle(handle)
+                            .serve(app.into_make_service_with_connect_info::<SocketAddr>())
+                            .await
+                        {
+                            tracing::error!(%error, "local HTTPS sender web server stopped");
+                        }
+                    } else {
+                        let listener = tokio::net::TcpListener::from_std(listener)
+                            .expect("failed to convert TCP listener");
+                        let _ = ready_tx.send(Ok(None));
+                        if let Err(error) = axum::serve(
+                            listener,
+                            app.into_make_service_with_connect_info::<SocketAddr>(),
+                        )
+                        .with_graceful_shutdown(async move {
+                            let _ = shutdown_rx.await;
+                        })
+                        .await
+                        {
+                            tracing::error!(%error, "local HTTP sender web server stopped");
+                        }
                     }
                 });
             })?;
+        let tls_config = match ready_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(config)) => config,
+            Ok(Err(error)) => {
+                let _ = thread.join();
+                anyhow::bail!(error)
+            }
+            Err(error) => {
+                let _ = shutdown_tx.send(());
+                let _ = thread.join();
+                anyhow::bail!("Webserver hat nicht rechtzeitig geantwortet: {error}")
+            }
+        };
         Ok(Self {
             shutdown_tx: Some(shutdown_tx),
             thread: Some(thread),
             address: actual_address,
+            tls_config,
         })
+    }
+
+    pub fn tls_config(&self) -> Option<axum_server::tls_rustls::RustlsConfig> {
+        self.tls_config.clone()
     }
 
     pub fn stop(mut self) {
@@ -323,6 +412,7 @@ async fn stream_socket(
             .lock()
             .expect("JPEG frame lock poisoned")
             .clone(),
+        StreamFormat::AudioPcm => None,
     };
     if let Some(frame) = initial_frame
         && socket
@@ -338,13 +428,15 @@ async fn stream_socket(
     loop {
         match frames.recv().await {
             Ok(frame) => {
-                if frame.format != format {
+                if frame.format != format && frame.format != StreamFormat::AudioPcm {
                     continue;
                 }
-                if waiting_for_keyframe && !frame.keyframe {
+                if waiting_for_keyframe && frame.format == StreamFormat::H264 && !frame.keyframe {
                     continue;
                 }
-                waiting_for_keyframe = false;
+                if frame.format == StreamFormat::H264 && frame.keyframe {
+                    waiting_for_keyframe = false;
+                }
                 if socket
                     .send(Message::Binary(frame.to_wire().into()))
                     .await
@@ -452,6 +544,32 @@ mod tests {
         assert!(state.latest_jpeg.lock().unwrap().is_some());
     }
 
+    #[test]
+    fn pcm_audio_uses_own_magic_and_preserves_video_geometry() {
+        let state = StreamState::new("1234".to_owned());
+        state.publish(EncodedFrame {
+            format: StreamFormat::H264,
+            width: 1920,
+            height: 1080,
+            timestamp_us: 1,
+            keyframe: true,
+            data: vec![1],
+        });
+        let audio = EncodedFrame {
+            format: StreamFormat::AudioPcm,
+            width: 48_000,
+            height: 2,
+            timestamp_us: 2,
+            keyframe: true,
+            data: vec![0, 0, 0, 0],
+        };
+        assert_eq!(&audio.to_wire()[..4], b"TSSA");
+        state.publish(audio);
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.audio_packets, 1);
+        assert_eq!((snapshot.width, snapshot.height), (1920, 1080));
+    }
+
     #[tokio::test]
     async fn login_rejects_bad_pin_and_returns_token_for_good_pin() {
         let state = StreamState::new("correct-pin".to_owned());
@@ -508,5 +626,42 @@ mod tests {
                 .headers()
                 .contains_key(header::CONTENT_SECURITY_POLICY)
         );
+    }
+
+    #[test]
+    fn local_https_server_serves_embedded_frontend() {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "tesla-screen-tls-{}-{:016x}",
+            std::process::id(),
+            rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let cert_path = directory.join("cert.pem");
+        let key_path = directory.join("key.pem");
+        std::fs::write(&cert_path, cert.pem()).unwrap();
+        std::fs::write(&key_path, signing_key.serialize_pem()).unwrap();
+
+        let server = LocalServer::start(
+            "127.0.0.1:0".parse().unwrap(),
+            StreamState::new("1234".to_owned()),
+            Some(TlsIdentity {
+                cert_path,
+                key_path,
+            }),
+        )
+        .unwrap();
+        let response = reqwest::blocking::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap()
+            .get(format!("https://localhost:{}/", server.address.port()))
+            .send()
+            .unwrap();
+        assert!(response.status().is_success());
+        assert!(response.text().unwrap().contains("Tesla Screen"));
+        server.stop();
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }

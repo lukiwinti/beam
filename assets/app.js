@@ -6,6 +6,7 @@ const loginError = document.querySelector("#login-error");
 const canvas = document.querySelector("#screen");
 const status = document.querySelector("#status");
 const fullscreenButton = document.querySelector("#fullscreen");
+const audioEnableButton = document.querySelector("#audio-enable");
 const modeNote = document.querySelector("#mode-note");
 const context = canvas.getContext("2d", { alpha: false, desynchronized: true });
 const hasWebCodecs = "VideoDecoder" in window && "EncodedVideoChunk" in window;
@@ -22,6 +23,11 @@ let pendingVideoFrame = null;
 let videoPaintScheduled = false;
 let waitingForKeyframe = true;
 const MAX_DECODE_QUEUE = 4;
+const MEDIA_LATENCY_SECONDS = 0.15;
+let audioContext = null;
+let audioAnchorTimestamp = null;
+let audioAnchorTime = 0;
+let nextAudioTime = 0;
 
 function showStatus(message, connected = false) {
   status.textContent = message;
@@ -72,7 +78,7 @@ function parseFrame(data) {
   const view = new DataView(data);
   if (data.byteLength < 25) return null;
   const magic = view.getUint32(0);
-  const format = magic === 0x54535331 ? "h264" : magic === 0x5453534a ? "jpeg" : null;
+  const format = magic === 0x54535331 ? "h264" : magic === 0x5453534a ? "jpeg" : magic === 0x54535341 ? "pcm" : null;
   if (!format) return null;
   const width = view.getUint32(4);
   const height = view.getUint32(8);
@@ -123,8 +129,16 @@ function scheduleVideoPaint() {
   requestAnimationFrame(() => {
     videoPaintScheduled = false;
     const frame = pendingVideoFrame;
-    pendingVideoFrame = null;
     if (!frame) return;
+    if (audioContext?.state === "running" && audioAnchorTimestamp !== null) {
+      const targetTime = audioAnchorTime + (frame.timestamp - audioAnchorTimestamp) / 1_000_000;
+      const delay = targetTime - audioContext.currentTime;
+      if (delay > 0.025) {
+        setTimeout(scheduleVideoPaint, Math.min(50, Math.max(4, delay * 1000 - 8)));
+        return;
+      }
+    }
+    pendingVideoFrame = null;
     sizeCanvas(frame.displayWidth, frame.displayHeight);
     context.drawImage(frame, 0, 0, canvas.width, canvas.height);
     frame.close();
@@ -133,8 +147,80 @@ function scheduleVideoPaint() {
   });
 }
 
-function queueJpeg(bytes) {
-  pendingJpeg = bytes.slice();
+function resetMediaClock() {
+  audioAnchorTimestamp = null;
+  audioAnchorTime = 0;
+  nextAudioTime = 0;
+}
+
+async function ensureAudioContext() {
+  if (!audioContext) {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      audioEnableButton.hidden = true;
+      return;
+    }
+    audioContext = new AudioContextClass({ latencyHint: "interactive" });
+  }
+  try {
+    await audioContext.resume();
+  } catch (error) {
+    console.warn("Audio activation failed", error);
+  }
+  audioEnableButton.hidden = audioContext.state === "running";
+}
+
+function queueAudio(frame) {
+  if (!audioContext || audioContext.state !== "running") {
+    audioEnableButton.hidden = false;
+    return;
+  }
+  const sampleRate = frame.width;
+  const channels = frame.height;
+  const frameCount = Math.floor(frame.bytes.byteLength / (channels * 2));
+  if (sampleRate < 8_000 || channels < 1 || channels > 8 || frameCount === 0) return;
+
+  const now = audioContext.currentTime;
+  if (audioAnchorTimestamp === null) {
+    audioAnchorTimestamp = frame.timestamp;
+    audioAnchorTime = now + MEDIA_LATENCY_SECONDS;
+    nextAudioTime = audioAnchorTime;
+  }
+  let scheduledTime = audioAnchorTime + (frame.timestamp - audioAnchorTimestamp) / 1_000_000;
+  if (scheduledTime < now - 0.05 || scheduledTime > now + 1) {
+    audioAnchorTimestamp = frame.timestamp;
+    audioAnchorTime = now + MEDIA_LATENCY_SECONDS;
+    nextAudioTime = audioAnchorTime;
+    scheduledTime = audioAnchorTime;
+  }
+  scheduledTime = Math.max(scheduledTime, nextAudioTime, now + 0.02);
+
+  const audioBuffer = audioContext.createBuffer(channels, frameCount, sampleRate);
+  const view = new DataView(frame.bytes.buffer, frame.bytes.byteOffset, frame.bytes.byteLength);
+  for (let channel = 0; channel < channels; channel += 1) {
+    const output = audioBuffer.getChannelData(channel);
+    for (let sample = 0; sample < frameCount; sample += 1) {
+      output[sample] = view.getInt16((sample * channels + channel) * 2, true) / 32768;
+    }
+  }
+  const source = audioContext.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(audioContext.destination);
+  source.start(scheduledTime);
+  nextAudioTime = scheduledTime + frameCount / sampleRate;
+}
+
+async function waitForMediaTime(timestamp) {
+  if (audioContext?.state !== "running" || audioAnchorTimestamp === null) return;
+  const targetTime = audioAnchorTime + (timestamp - audioAnchorTimestamp) / 1_000_000;
+  const delayMs = (targetTime - audioContext.currentTime) * 1000;
+  if (delayMs > 4) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(250, delayMs)));
+  }
+}
+
+function queueJpeg(frame) {
+  pendingJpeg = { bytes: frame.bytes.slice(), timestamp: frame.timestamp };
   if (jpegDecodeRunning) return;
   jpegDecodeRunning = true;
   (async () => {
@@ -142,7 +228,9 @@ function queueJpeg(bytes) {
       const nextJpeg = pendingJpeg;
       pendingJpeg = null;
       try {
-        await drawJpeg(nextJpeg);
+        await waitForMediaTime(nextJpeg.timestamp);
+        if (pendingJpeg) continue;
+        await drawJpeg(nextJpeg.bytes);
         showStatus("Verbunden (HTTP-Kompatibilitätsmodus)", true);
       } catch (error) {
         console.error("JPEG frame decode failed", error);
@@ -167,8 +255,12 @@ function connect() {
   socket.onmessage = (event) => {
     const frame = parseFrame(event.data);
     if (!frame) return;
+    if (frame.format === "pcm") {
+      queueAudio(frame);
+      return;
+    }
     if (frame.format === "jpeg") {
-      queueJpeg(frame.bytes);
+      queueJpeg(frame);
       return;
     }
     if (waitingForKeyframe && !frame.keyframe) return;
@@ -196,6 +288,7 @@ function connect() {
     }
   };
   socket.onclose = (event) => {
+    resetMediaClock();
     if (!opened) consecutiveConnectFailures += 1;
     if (event.code === 1008 || event.code === 1002 || consecutiveConnectFailures >= 3) {
       sessionStorage.removeItem("tesla-screen-token");
@@ -214,6 +307,7 @@ function connect() {
 
 loginForm.addEventListener("submit", async (event) => {
   event.preventDefault();
+  void ensureAudioContext();
   loginError.textContent = "";
   try {
     const response = await fetch("/api/login", {
@@ -237,12 +331,17 @@ loginForm.addEventListener("submit", async (event) => {
 });
 
 fullscreenButton.addEventListener("click", async () => {
+  void ensureAudioContext();
   try {
     if (!document.fullscreenElement) await viewer.requestFullscreen();
     else await document.exitFullscreen();
   } catch (error) {
     console.warn("Fullscreen unavailable", error);
   }
+});
+
+audioEnableButton.addEventListener("click", () => {
+  void ensureAudioContext();
 });
 
 if (!hasWebCodecs) {

@@ -28,6 +28,7 @@ struct CaptureFlags {
     state: Arc<StreamState>,
     fps: u32,
     bitrate_kbps: u32,
+    started_at: Instant,
 }
 
 struct ScreenCapture {
@@ -67,7 +68,7 @@ impl GraphicsCaptureApiHandler for ScreenCapture {
             yuv: None,
             scratch: Vec::new(),
             jpeg_rgb: Vec::new(),
-            started_at: Instant::now(),
+            started_at: context.flags.started_at,
             last_jpeg_at: None,
             jpeg_interval: Duration::from_secs_f64(1.0 / f64::from(context.flags.fps.min(20))),
         })
@@ -187,6 +188,7 @@ impl CaptureSession {
         bitrate_kbps: u32,
         capture_cursor: bool,
         state: Arc<StreamState>,
+        started_at: Instant,
     ) -> Result<Self> {
         let monitor = Monitor::from_index(monitor_index)
             .with_context(|| format!("Bildschirm {monitor_index} wurde nicht gefunden"))?;
@@ -206,6 +208,7 @@ impl CaptureSession {
                 state,
                 fps,
                 bitrate_kbps,
+                started_at,
             },
         );
         let control = ScreenCapture::start_free_threaded(settings)

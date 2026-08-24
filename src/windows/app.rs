@@ -1,43 +1,76 @@
 use super::{
+    acme::{
+        AcmeRequest, CertificateRenewer, PROVIDERS, PreparedCertificate, prepare_certificate,
+        provider,
+    },
+    audio::AudioSession,
     capture::CaptureSession,
     monitor::{DisplayInfo, enumerate_displays},
+    secrets::SecretStore,
 };
 use crate::{
     config::SenderConfig,
-    server::{LocalServer, StreamState},
+    server::{LocalServer, StreamState, TlsIdentity},
 };
 use eframe::egui;
 use local_ip_address::local_ip;
 use std::{
     net::{IpAddr, Ipv4Addr},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, mpsc},
+    time::{Duration, Instant},
 };
 
 struct RunningSender {
     server: LocalServer,
     capture: CaptureSession,
+    audio: Option<AudioSession>,
+    certificate_renewer: Option<CertificateRenewer>,
     state: Arc<StreamState>,
     url: String,
 }
 
 pub struct SenderApp {
     config: SenderConfig,
+    secrets: SecretStore,
     displays: Vec<DisplayInfo>,
     running: Option<RunningSender>,
+    pending_start: Option<mpsc::Receiver<anyhow::Result<PreparedCertificate>>>,
     message: Option<(bool, String)>,
+    show_settings: bool,
 }
 
 impl SenderApp {
     fn new(context: &eframe::CreationContext<'_>) -> Self {
         context.egui_ctx.set_pixels_per_point(1.15);
+        let (config, load_error) = match SenderConfig::load() {
+            Ok(config) => (config, None),
+            Err(error) => (SenderConfig::default(), Some(error.to_string())),
+        };
+        let (secrets, secret_error) = match SecretStore::load() {
+            Ok(secrets) => (secrets, None),
+            Err(error) => (SecretStore::default(), Some(error.to_string())),
+        };
         let mut app = Self {
-            config: SenderConfig::default(),
+            config,
+            secrets,
             displays: Vec::new(),
             running: None,
+            pending_start: None,
             message: None,
+            show_settings: false,
         };
         app.refresh_displays();
+        if let Some(error) = load_error {
+            app.message = Some((
+                false,
+                format!("Einstellungen konnten nicht geladen werden: {error}"),
+            ));
+        } else if let Some(error) = secret_error {
+            app.message = Some((
+                false,
+                format!("Gespeicherte DNS-Zugangsdaten konnten nicht geladen werden: {error}"),
+            ));
+        }
         app
     }
 
@@ -80,9 +113,56 @@ impl SenderApp {
             ));
             return;
         }
+        if let Err(error) = self.save_settings() {
+            self.message = Some((
+                false,
+                format!("Einstellungen konnten nicht gespeichert werden: {error}"),
+            ));
+            return;
+        }
 
+        if self.config.https_enabled {
+            let request = AcmeRequest {
+                domain: self.config.https_domain.trim().to_owned(),
+                email: self.config.acme_email.trim().to_owned(),
+                provider: self.config.dns_provider.clone(),
+                credentials: self.secrets.credentials(&self.config.dns_provider),
+            };
+            if let Err(error) = request.validate_credentials() {
+                self.message = Some((false, error.to_string()));
+                return;
+            }
+            let (result_tx, result_rx) = mpsc::sync_channel(1);
+            if let Err(error) = std::thread::Builder::new()
+                .name("tesla-screen-acme-prepare".to_owned())
+                .spawn(move || {
+                    let _ = result_tx.send(prepare_certificate(request));
+                })
+            {
+                self.message = Some((
+                    false,
+                    format!("Zertifikatsprüfung konnte nicht gestartet werden: {error}"),
+                ));
+                return;
+            }
+            self.pending_start = Some(result_rx);
+            self.message = Some((
+                true,
+                "Let's-Encrypt-Zertifikat wird im Hintergrund geprüft oder ausgestellt …"
+                    .to_owned(),
+            ));
+        } else {
+            self.start_ready(None);
+        }
+    }
+
+    fn start_ready(&mut self, certificate: Option<PreparedCertificate>) {
         let state = StreamState::new(self.config.pin.clone());
-        let server = match LocalServer::start(self.config.socket_addr(), Arc::clone(&state)) {
+        let tls = certificate.as_ref().map(|certificate| TlsIdentity {
+            cert_path: certificate.cert_path.clone(),
+            key_path: certificate.key_path.clone(),
+        });
+        let server = match LocalServer::start(self.config.socket_addr(), Arc::clone(&state), tls) {
             Ok(server) => server,
             Err(error) => {
                 self.message = Some((
@@ -92,12 +172,14 @@ impl SenderApp {
                 return;
             }
         };
+        let started_at = Instant::now();
         let capture = match CaptureSession::start(
             self.config.monitor_index,
             self.config.fps,
             self.config.bitrate_kbps,
             self.config.capture_cursor,
             Arc::clone(&state),
+            started_at,
         ) {
             Ok(capture) => capture,
             Err(error) => {
@@ -106,12 +188,32 @@ impl SenderApp {
                 return;
             }
         };
+        let audio = if self.config.audio_enabled {
+            match AudioSession::start(Arc::clone(&state), started_at) {
+                Ok(audio) => Some(audio),
+                Err(error) => {
+                    let _ = capture.stop();
+                    server.stop();
+                    self.message = Some((false, error.to_string()));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
 
         let ip = local_ip().unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
         let url = self.config.browser_url(ip);
+        let certificate_renewer = certificate.and_then(|certificate| {
+            server
+                .tls_config()
+                .map(|tls| certificate.start_renewer(tls))
+        });
         self.running = Some(RunningSender {
             server,
             capture,
+            audio,
+            certificate_renewer,
             state,
             url: url.clone(),
         });
@@ -120,13 +222,220 @@ impl SenderApp {
 
     fn stop(&mut self) {
         if let Some(running) = self.running.take() {
+            if let Some(renewer) = running.certificate_renewer {
+                renewer.stop();
+            }
+            let audio_result = running.audio.map(AudioSession::stop).unwrap_or(Ok(()));
             let capture_result = running.capture.stop();
             running.server.stop();
-            self.message = Some(match capture_result {
-                Ok(()) => (true, "Stream wurde beendet.".to_owned()),
-                Err(error) => (false, format!("Stream beendet; Aufnahmefehler: {error}")),
+            self.message = Some(match (capture_result, audio_result) {
+                (Ok(()), Ok(())) => (true, "Stream wurde beendet.".to_owned()),
+                (Err(error), _) => (false, format!("Stream beendet; Aufnahmefehler: {error}")),
+                (_, Err(error)) => (false, format!("Stream beendet; Audiofehler: {error}")),
             });
         }
+    }
+
+    fn save_settings(&self) -> anyhow::Result<std::path::PathBuf> {
+        let path = self.config.save()?;
+        self.secrets.save()?;
+        Ok(path)
+    }
+
+    fn poll_pending_start(&mut self) {
+        let result = self
+            .pending_start
+            .as_ref()
+            .and_then(|receiver| match receiver.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(anyhow::anyhow!(
+                    "Zertifikatsprüfung wurde unerwartet beendet"
+                ))),
+            });
+        if let Some(result) = result {
+            self.pending_start = None;
+            match result {
+                Ok(certificate) => self.start_ready(Some(certificate)),
+                Err(error) => {
+                    self.message = Some((false, error.to_string()));
+                }
+            }
+        }
+    }
+
+    fn settings_window(&mut self, context: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = self.show_settings;
+        egui::Window::new("Einstellungen")
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_width(620.0)
+            .vscroll(true)
+            .show(context, |ui| {
+                ui.add_enabled_ui(self.running.is_none() && self.pending_start.is_none(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Bildschirm");
+                        let selected = self
+                            .displays
+                            .iter()
+                            .find(|display| display.index == self.config.monitor_index)
+                            .map(DisplayInfo::label)
+                            .unwrap_or_else(|| "Kein Bildschirm".to_owned());
+                        egui::ComboBox::from_id_salt("settings-monitor")
+                            .selected_text(selected)
+                            .width(390.0)
+                            .show_ui(ui, |ui| {
+                                for display in &self.displays {
+                                    ui.selectable_value(
+                                        &mut self.config.monitor_index,
+                                        display.index,
+                                        display.label(),
+                                    );
+                                }
+                            });
+                        if ui.button("Neu laden").clicked() {
+                            self.refresh_displays();
+                        }
+                    });
+                    ui.add_space(8.0);
+                    egui::Grid::new("persistent-settings")
+                        .num_columns(2)
+                        .spacing([16.0, 10.0])
+                        .show(ui, |ui| {
+                            ui.label("Webserver-Port");
+                            ui.add(egui::DragValue::new(&mut self.config.port).range(1..=u16::MAX));
+                            ui.end_row();
+
+                            ui.label("Bildrate");
+                            ui.add(egui::Slider::new(&mut self.config.fps, 1..=60).suffix(" FPS"));
+                            ui.end_row();
+
+                            ui.label("Bitrate");
+                            ui.add(
+                                egui::Slider::new(&mut self.config.bitrate_kbps, 500..=50_000)
+                                    .suffix(" kbit/s"),
+                            );
+                            ui.end_row();
+
+                            ui.label("Anmelde-PIN");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.config.pin)
+                                    .password(true)
+                                    .desired_width(180.0),
+                            );
+                            ui.end_row();
+
+                            ui.label("Mauszeiger übertragen");
+                            ui.checkbox(&mut self.config.capture_cursor, "anzeigen");
+                            ui.end_row();
+
+                            ui.label("Systemton übertragen");
+                            ui.checkbox(&mut self.config.audio_enabled, "aktiv");
+                            ui.end_row();
+                        });
+
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.heading("HTTPS und Let's Encrypt");
+                    ui.checkbox(
+                        &mut self.config.https_enabled,
+                        "HTTPS mit automatischem Let's-Encrypt-Zertifikat",
+                    );
+                    if self.config.https_enabled {
+                        ui.add_space(6.0);
+                        egui::Grid::new("https-settings")
+                            .num_columns(2)
+                            .spacing([16.0, 10.0])
+                            .show(ui, |ui| {
+                                ui.label("Domain");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.config.https_domain)
+                                        .hint_text("screen.example.de")
+                                        .desired_width(330.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("Let's-Encrypt-E-Mail");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.config.acme_email)
+                                        .hint_text("admin@example.de")
+                                        .desired_width(330.0),
+                                );
+                                ui.end_row();
+
+                                ui.label("DNS-Provider");
+                                let selected_provider = provider(&self.config.dns_provider)
+                                    .map(|provider| provider.name)
+                                    .unwrap_or("Unbekannt");
+                                egui::ComboBox::from_id_salt("dns-provider")
+                                    .selected_text(selected_provider)
+                                    .width(260.0)
+                                    .show_ui(ui, |ui| {
+                                        for definition in PROVIDERS {
+                                            ui.selectable_value(
+                                                &mut self.config.dns_provider,
+                                                definition.code.to_owned(),
+                                                definition.name,
+                                            );
+                                        }
+                                    });
+                                ui.end_row();
+                            });
+
+                        if let Some(definition) = provider(&self.config.dns_provider) {
+                            let credentials =
+                                self.secrets.credentials_mut(&self.config.dns_provider);
+                            egui::Grid::new("dns-credentials")
+                                .num_columns(2)
+                                .spacing([16.0, 10.0])
+                                .show(ui, |ui| {
+                                    for field in definition.fields {
+                                        ui.label(field.label);
+                                        let value = credentials
+                                            .entry(field.environment.to_owned())
+                                            .or_default();
+                                        ui.add(
+                                            egui::TextEdit::singleline(value)
+                                                .password(true)
+                                                .desired_width(330.0),
+                                        );
+                                        ui.end_row();
+                                    }
+                                });
+                        }
+
+                        ui.checkbox(
+                            &mut self.config.acme_accept_tos,
+                            "Ich akzeptiere die Let's-Encrypt-Nutzungsbedingungen",
+                        );
+                        ui.small(
+                            "Der API-Schlüssel wird mit Windows DPAPI verschlüsselt. Der ACME-Client wird beim ersten HTTPS-Start geprüft heruntergeladen; Zertifikate werden alle 12 Stunden geprüft und rechtzeitig erneuert.",
+                        );
+                        ui.small(
+                            "Wichtig: Die Domain muss im Tesla-Netz auf die IP dieses Windows-PCs auflösen.",
+                        );
+                    }
+
+                    ui.add_space(10.0);
+                    if ui.button("Einstellungen speichern").clicked() {
+                        self.message = Some(match self.save_settings() {
+                            Ok(path) => (
+                                true,
+                                format!("Einstellungen gespeichert: {}", path.display()),
+                            ),
+                            Err(error) => (false, format!("Speichern fehlgeschlagen: {error}")),
+                        });
+                    }
+                });
+                if self.running.is_some() || self.pending_start.is_some() {
+                    ui.small("Zum Ändern der Einstellungen zuerst den Stream stoppen.");
+                }
+            });
+        self.show_settings = open;
     }
 }
 
@@ -134,6 +443,7 @@ impl eframe::App for SenderApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         context.request_repaint_after(Duration::from_millis(250));
+        self.poll_pending_start();
 
         if let Some(running) = &mut self.running
             && let Some(result) = running.capture.wait_if_finished()
@@ -148,60 +458,74 @@ impl eframe::App for SenderApp {
             self.message = Some((false, message));
         }
 
+        if let Some(running) = &mut self.running
+            && let Some(result) = running
+                .audio
+                .as_mut()
+                .and_then(AudioSession::wait_if_finished)
+        {
+            let message = match result {
+                Ok(()) => "Die Systemton-Aufnahme wurde beendet.".to_owned(),
+                Err(error) => format!("Systemton-Aufnahme abgebrochen: {error}"),
+            };
+            if let Some(running) = self.running.take() {
+                let _ = running.capture.stop();
+                running.server.stop();
+            }
+            self.message = Some((false, message));
+        }
+
         egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading("Tesla Screen Sender");
+            ui.horizontal(|ui| {
+                ui.heading("Tesla Screen Sender");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            self.pending_start.is_none(),
+                            egui::Button::new("⚙ Einstellungen"),
+                        )
+                        .clicked()
+                    {
+                        self.show_settings = true;
+                    }
+                });
+            });
             ui.label("Eigenständige Monitorübertragung für den Tesla-Browser im lokalen Netzwerk");
             ui.add_space(12.0);
 
-            ui.add_enabled_ui(self.running.is_none(), |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Bildschirm");
-                    let selected = self.displays.iter()
-                        .find(|display| display.index == self.config.monitor_index)
-                        .map(DisplayInfo::label)
-                        .unwrap_or_else(|| "Kein Bildschirm".to_owned());
-                    egui::ComboBox::from_id_salt("monitor")
-                        .selected_text(selected)
-                        .width(470.0)
-                        .show_ui(ui, |ui| {
-                            for display in &self.displays {
-                                ui.selectable_value(&mut self.config.monitor_index, display.index, display.label());
-                            }
-                        });
-                    if ui.button("Neu laden").clicked() {
-                        self.refresh_displays();
-                    }
-                });
-
-                egui::Grid::new("settings").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-                    ui.label("Webserver-Port");
-                    ui.add(egui::DragValue::new(&mut self.config.port).range(1..=u16::MAX));
-                    ui.end_row();
-
-                    ui.label("Bildrate");
-                    ui.add(egui::Slider::new(&mut self.config.fps, 1..=60).suffix(" FPS"));
-                    ui.end_row();
-
-                    ui.label("Bitrate");
-                    ui.add(egui::Slider::new(&mut self.config.bitrate_kbps, 500..=50_000).suffix(" kbit/s"));
-                    ui.end_row();
-
-                    ui.label("Anmelde-PIN");
-                    ui.add(egui::TextEdit::singleline(&mut self.config.pin).password(true).desired_width(180.0));
-                    ui.end_row();
-
-                    ui.label("Mauszeiger übertragen");
-                    ui.checkbox(&mut self.config.capture_cursor, "anzeigen");
-                    ui.end_row();
-                });
-            });
+            let selected_monitor = self
+                .displays
+                .iter()
+                .find(|display| display.index == self.config.monitor_index)
+                .map(DisplayInfo::label)
+                .unwrap_or_else(|| "Kein Bildschirm".to_owned());
+            ui.label(format!("Bildschirm: {selected_monitor}"));
+            ui.label(format!(
+                "{} FPS · {} kbit/s · Ton {} · {}",
+                self.config.fps,
+                self.config.bitrate_kbps,
+                if self.config.audio_enabled { "an" } else { "aus" },
+                if self.config.https_enabled {
+                    format!("HTTPS ({})", self.config.https_domain)
+                } else {
+                    "HTTP".to_owned()
+                }
+            ));
 
             ui.add_space(12.0);
             if self.running.is_some() {
                 if ui.add_sized([150.0, 36.0], egui::Button::new("Stream stoppen")).clicked() {
                     self.stop();
                 }
-            } else if ui.add_sized([150.0, 36.0], egui::Button::new("Stream starten")).clicked() {
+            } else if self.pending_start.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Zertifikat wird vorbereitet …");
+                });
+            } else if ui
+                .add_sized([150.0, 36.0], egui::Button::new("Stream starten"))
+                .clicked()
+            {
                 self.start();
             }
 
@@ -218,8 +542,12 @@ impl eframe::App for SenderApp {
                 ui.label(format!("PIN: {}", self.config.pin));
                 let snapshot = running.state.snapshot();
                 ui.label(format!(
-                    "{} Browser verbunden · {} Frames · {} × {}",
-                    snapshot.clients, snapshot.frames, snapshot.width, snapshot.height
+                    "{} Browser verbunden · {} Frames · {} Audiopakete · {} × {}",
+                    snapshot.clients,
+                    snapshot.frames,
+                    snapshot.audio_packets,
+                    snapshot.width,
+                    snapshot.height
                 ));
                 if snapshot.jpeg_clients > 0 {
                     ui.small(format!(
@@ -238,17 +566,21 @@ impl eframe::App for SenderApp {
                 );
             }
         });
+        self.settings_window(&context);
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.stop();
+        if let Err(error) = self.save_settings() {
+            tracing::error!(%error, "settings could not be saved on exit");
+        }
     }
 }
 
 pub fn run() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([760.0, 540.0])
+            .with_inner_size([760.0, 560.0])
             .with_min_inner_size([680.0, 480.0]),
         ..Default::default()
     };
