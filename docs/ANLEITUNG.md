@@ -119,9 +119,19 @@ Der Browser versucht nach jeder WLAN- oder Serverunterbrechung zeitlich unbegren
 
 Wurde die PIN seit dem Öffnen der Seite bereits eingegeben, kann die Seite nach einem Neustart der Windows-App selbstständig ein neues Sitzungstoken anfordern. Nach einem vollständigen Neuladen der Seite bleibt nur das Sitzungstoken erhalten; falls dieses durch einen Serverneustart ungültig wurde, erscheint das PIN-Feld wieder. Die Wiederverbindungsversuche laufen auch dann im Hintergrund endlos weiter.
 
+## Touchbedienung und Tesla-Tastatur
+
+Die persistente Einstellung „Bedienung übertragen“ ist aus Sicherheitsgründen standardmäßig deaktiviert. Ist sie aktiv, werden Pointer-Ereignisse des Tesla-Browsers als echte Windows-Touchkontakte auf den ausgewählten Monitor abgebildet. Antippen entspricht einem Touch-Tap, eine Fingerbewegung bleibt eine Touchbewegung für natives Scrollen beziehungsweise Wischen, und ein stationär gehaltener Kontakt wird regelmäßig erneuert, damit Windows ein langes Drücken erkennen kann. Die Webseite unterbindet dabei ihre eigene Textauswahl und Browser-Scrollbewegung.
+
+Der Eingaberückkanal ist nur nach erfolgreicher PIN-Anmeldung erreichbar. Trotzdem sollte bei aktivierter Bedienung eine starke, nicht anderweitig verwendete PIN gesetzt und der Dienst nur in einem vertrauenswürdigen Fahrzeugnetz betrieben werden, da ein angemeldeter Browser den Windows-Rechner bedienen kann.
+
+Nach einem Tap prüft Windows UI Automation, ob ein beschreibbares Eingabefeld den Fokus erhalten hat. Nur dann bleibt das unsichtbare Browser-Eingabefeld fokussiert, die Tesla-Bildschirmtastatur wird geöffnet und der Stream wird so weit nach oben verschoben, dass das fokussierte Windows-Feld im sichtbaren Bereich bleibt. Text, Rückschritt, Löschen, Enter, Tabulator, Escape, Pfeiltasten, Pos1 und Ende werden an Windows weitergegeben.
+
+Windows verhindert aus Sicherheitsgründen Eingabeinjektion in Programme mit höherer Berechtigungsstufe. Eine normal gestartete Sender-App kann deshalb keine als Administrator gestarteten Programme bedienen. Mehrere gleichzeitig verbundene Browser sollten nicht parallel denselben Bildschirm steuern.
+
 ## Grenzen der ersten Version
 
-- Der Browser ist nur Empfänger. Touch-, Maus- und Tastatureingaben werden nicht zurück an Windows gesendet.
+- Maus- und physische Tastatureingaben auf dem Tesla werden nur insoweit unterstützt, wie sie als Pointer- beziehungsweise Tastaturereignisse des Browsers ankommen. Der primäre Bedienpfad ist der Touchscreen.
 - Der FPS-Wert ist die gewünschte Obergrenze. Die Hauptansicht zeigt zusätzlich die tatsächlich kodierte Bildrate. Sie hängt vom Monitortakt, der Bildrate des Quellvideos und der CPU-Leistung ab. Bei 60 FPS verwendet die Aufnahme direkt den nativen Displaytakt, um ein Unterschwingen durch den Windows-Aufnahmetimer zu vermeiden.
 - OpenH264 kodiert in dieser Version per CPU. 4K bei hoher Bildrate kann deshalb je nach Laptop zu langsam sein. Für 1920×1080 sind 30 FPS ein sinnvoller Startpunkt.
 - OpenH264 unterstützt maximal 3840×2160 im Querformat beziehungsweise 2160×3840 im Hochformat.

@@ -24,8 +24,19 @@
     <section id="viewer" hidden>
       <canvas id="screen"></canvas>
       <div id="status" class="status">Verbindung wird hergestellt …</div>
+      <div id="control-state" class="control-state" hidden>Bedienung aktiv</div>
       <button id="audio-enable" class="audio-enable" type="button" aria-label="Ton aktivieren">🔊</button>
       <button id="fullscreen" class="fullscreen" type="button" aria-label="Vollbild">⛶</button>
+      <textarea
+        id="remote-keyboard"
+        class="remote-keyboard"
+        aria-label="Windows-Texteingabe"
+        autocomplete="off"
+        autocorrect="off"
+        autocapitalize="off"
+        enterkeyhint="enter"
+        spellcheck="false"
+      ></textarea>
     </section>
 
     <script src="/app.js" defer></script>

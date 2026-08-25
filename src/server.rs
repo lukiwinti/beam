@@ -75,6 +75,88 @@ pub struct StreamSnapshot {
     pub audio_packets: u64,
     pub width: u32,
     pub height: u32,
+    pub control_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum TouchPhase {
+    Down,
+    Move,
+    Up,
+    Cancel,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteKey {
+    Backspace,
+    Delete,
+    Enter,
+    Tab,
+    Escape,
+    ArrowLeft,
+    ArrowRight,
+    ArrowUp,
+    ArrowDown,
+    Home,
+    End,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RemoteInputEvent {
+    Touch {
+        phase: TouchPhase,
+        id: u32,
+        x: f64,
+        y: f64,
+    },
+    Text {
+        text: String,
+    },
+    Key {
+        key: RemoteKey,
+    },
+    CancelAll,
+}
+
+impl RemoteInputEvent {
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Touch { id, x, y, .. } => {
+                *id > 0
+                    && *id <= 1_000_000
+                    && x.is_finite()
+                    && y.is_finite()
+                    && (0.0..=1.0).contains(x)
+                    && (0.0..=1.0).contains(y)
+            }
+            Self::Text { text } => !text.contains('\0') && text.encode_utf16().count() <= 1_024,
+            Self::Key { .. } => true,
+            Self::CancelAll => true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct NormalizedRect {
+    pub left: f64,
+    pub top: f64,
+    pub right: f64,
+    pub bottom: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ControlSignal {
+    Control {
+        enabled: bool,
+    },
+    Keyboard {
+        show: bool,
+        rect: Option<NormalizedRect>,
+    },
 }
 
 pub struct StreamState {
@@ -89,11 +171,14 @@ pub struct StreamState {
     audio_packets: AtomicU64,
     width: AtomicU32,
     height: AtomicU32,
+    input_tx: Mutex<Option<mpsc::Sender<RemoteInputEvent>>>,
+    control_tx: broadcast::Sender<ControlSignal>,
 }
 
 impl StreamState {
     pub fn new(pin: String) -> Arc<Self> {
         let (frame_tx, _) = broadcast::channel(64);
+        let (control_tx, _) = broadcast::channel(16);
         let token = format!("{:032x}", rand::rng().random::<u128>());
         Arc::new(Self {
             frame_tx,
@@ -107,6 +192,8 @@ impl StreamState {
             audio_packets: AtomicU64::new(0),
             width: AtomicU32::new(0),
             height: AtomicU32::new(0),
+            input_tx: Mutex::new(None),
+            control_tx,
         })
     }
 
@@ -153,6 +240,49 @@ impl StreamState {
             audio_packets: self.audio_packets.load(Ordering::Relaxed),
             width: self.width.load(Ordering::Relaxed),
             height: self.height.load(Ordering::Relaxed),
+            control_enabled: self.control_enabled(),
+        }
+    }
+
+    pub fn enable_control(&self, input_tx: mpsc::Sender<RemoteInputEvent>) {
+        *self.input_tx.lock().expect("input sender lock poisoned") = Some(input_tx);
+        self.publish_control(ControlSignal::Control { enabled: true });
+    }
+
+    pub fn disable_control(&self) {
+        self.input_tx
+            .lock()
+            .expect("input sender lock poisoned")
+            .take();
+        self.publish_control(ControlSignal::Control { enabled: false });
+        self.publish_control(ControlSignal::Keyboard {
+            show: false,
+            rect: None,
+        });
+    }
+
+    pub fn publish_control(&self, signal: ControlSignal) {
+        let _ = self.control_tx.send(signal);
+    }
+
+    fn control_enabled(&self) -> bool {
+        self.input_tx
+            .lock()
+            .expect("input sender lock poisoned")
+            .is_some()
+    }
+
+    fn dispatch_input(&self, event: RemoteInputEvent) {
+        if !event.is_valid() {
+            return;
+        }
+        let sender = self
+            .input_tx
+            .lock()
+            .expect("input sender lock poisoned")
+            .clone();
+        if let Some(sender) = sender {
+            let _ = sender.send(event);
         }
     }
 
@@ -397,6 +527,20 @@ async fn stream_socket(
         state.jpeg_clients.fetch_add(1, Ordering::Relaxed);
     }
     let mut frames = state.frame_tx.subscribe();
+    let mut controls = state.control_tx.subscribe();
+
+    if send_control_signal(
+        &mut socket,
+        &ControlSignal::Control {
+            enabled: state.control_enabled(),
+        },
+    )
+    .await
+    .is_err()
+    {
+        decrement_clients(&state, format);
+        return;
+    }
 
     let initial_frame = match format {
         StreamFormat::H264 => state
@@ -423,8 +567,9 @@ async fn stream_socket(
 
     let mut waiting_for_keyframe = false;
     loop {
-        match frames.recv().await {
-            Ok(frame) => {
+        tokio::select! {
+            frame = frames.recv() => match frame {
+                Ok(frame) => {
                 if frame.format != format && frame.format != StreamFormat::AudioPcm {
                     continue;
                 }
@@ -441,14 +586,42 @@ async fn stream_socket(
                 {
                     break;
                 }
-            }
-            Err(broadcast::error::RecvError::Lagged(_)) => {
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
                 waiting_for_keyframe = format == StreamFormat::H264;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            incoming = socket.recv() => match incoming {
+                Some(Ok(Message::Text(text))) => {
+                    if let Ok(event) = serde_json::from_str::<RemoteInputEvent>(text.as_str()) {
+                        state.dispatch_input(event);
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                Some(Ok(_)) => {}
+            },
+            signal = controls.recv() => match signal {
+                Ok(signal) => {
+                    if send_control_signal(&mut socket, &signal).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
             }
-            Err(broadcast::error::RecvError::Closed) => break,
         }
     }
+    state.dispatch_input(RemoteInputEvent::CancelAll);
     decrement_clients(&state, format);
+}
+
+async fn send_control_signal(
+    socket: &mut axum::extract::ws::WebSocket,
+    signal: &ControlSignal,
+) -> Result<(), axum::Error> {
+    let json = serde_json::to_string(signal).expect("control signal serialization failed");
+    socket.send(Message::Text(json.into())).await
 }
 
 fn decrement_clients(state: &StreamState, format: StreamFormat) {
@@ -502,6 +675,38 @@ mod tests {
         assert!(!constant_time_eq(b"123456", b"123457"));
         assert!(!constant_time_eq(b"x", &[b'x'; 257]));
         assert!(!constant_time_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn remote_input_is_validated_and_dispatched_only_when_enabled() {
+        let state = StreamState::new("1234".to_owned());
+        let valid = RemoteInputEvent::Touch {
+            phase: TouchPhase::Down,
+            id: 1,
+            x: 0.25,
+            y: 0.75,
+        };
+        let invalid = RemoteInputEvent::Touch {
+            phase: TouchPhase::Move,
+            id: 2,
+            x: -0.1,
+            y: 1.2,
+        };
+        state.dispatch_input(valid.clone());
+
+        let (input_tx, input_rx) = mpsc::channel();
+        state.enable_control(input_tx);
+        assert!(state.snapshot().control_enabled);
+        state.dispatch_input(invalid);
+        state.dispatch_input(valid.clone());
+        assert_eq!(
+            input_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            valid
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        state.disable_control();
+        assert!(!state.snapshot().control_enabled);
     }
 
     #[test]

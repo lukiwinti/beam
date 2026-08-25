@@ -20,6 +20,7 @@ pub struct SenderConfig {
     pub pin: String,
     pub capture_cursor: bool,
     pub audio_enabled: bool,
+    pub control_enabled: bool,
     pub https_enabled: bool,
     pub https_domain: String,
     pub acme_email: String,
@@ -38,6 +39,7 @@ impl Default for SenderConfig {
             pin: "123456".to_owned(),
             capture_cursor: true,
             audio_enabled: true,
+            control_enabled: false,
             https_enabled: false,
             https_domain: String::new(),
             acme_email: String::new(),
@@ -254,6 +256,7 @@ mod tests {
         )
         .unwrap();
         assert!(SenderConfig::load_from_path(&path).unwrap().audio_enabled);
+        assert!(!SenderConfig::load_from_path(&path).unwrap().control_enabled);
         fs::remove_dir_all(directory).unwrap();
     }
 }

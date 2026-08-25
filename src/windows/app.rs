@@ -5,6 +5,7 @@ use super::{
     },
     audio::AudioSession,
     capture::CaptureSession,
+    input::InputSession,
     monitor::{DisplayInfo, enumerate_displays},
     secrets::SecretStore,
 };
@@ -24,6 +25,7 @@ struct RunningSender {
     server: LocalServer,
     capture: CaptureSession,
     audio: Option<AudioSession>,
+    input: Option<InputSession>,
     certificate_renewer: Option<CertificateRenewer>,
     state: Arc<StreamState>,
     url: String,
@@ -164,6 +166,17 @@ impl SenderApp {
 
     fn start_ready(&mut self, certificate: Option<PreparedCertificate>) {
         let state = StreamState::new(self.config.pin.clone());
+        let input = if self.config.control_enabled {
+            match InputSession::start(Arc::clone(&state), self.config.monitor_index) {
+                Ok(input) => Some(input),
+                Err(error) => {
+                    self.message = Some((false, error.to_string()));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let tls = certificate.as_ref().map(|certificate| TlsIdentity {
             cert_path: certificate.cert_path.clone(),
             key_path: certificate.key_path.clone(),
@@ -171,6 +184,9 @@ impl SenderApp {
         let server = match LocalServer::start(self.config.socket_addr(), Arc::clone(&state), tls) {
             Ok(server) => server,
             Err(error) => {
+                if let Some(input) = input {
+                    input.stop();
+                }
                 self.message = Some((
                     false,
                     format!("Webserver konnte nicht gestartet werden: {error}"),
@@ -189,6 +205,9 @@ impl SenderApp {
         ) {
             Ok(capture) => capture,
             Err(error) => {
+                if let Some(input) = input {
+                    input.stop();
+                }
                 server.stop();
                 self.message = Some((false, error.to_string()));
                 return;
@@ -198,6 +217,9 @@ impl SenderApp {
             match AudioSession::start(Arc::clone(&state), started_at) {
                 Ok(audio) => Some(audio),
                 Err(error) => {
+                    if let Some(input) = input {
+                        input.stop();
+                    }
                     let _ = capture.stop();
                     server.stop();
                     self.message = Some((false, error.to_string()));
@@ -219,6 +241,7 @@ impl SenderApp {
             server,
             capture,
             audio,
+            input,
             certificate_renewer,
             state,
             url: url.clone(),
@@ -235,6 +258,9 @@ impl SenderApp {
                 renewer.stop();
             }
             let audio_result = running.audio.map(AudioSession::stop).unwrap_or(Ok(()));
+            if let Some(input) = running.input {
+                input.stop();
+            }
             let capture_result = running.capture.stop();
             running.server.stop();
             self.message = Some(match (capture_result, audio_result) {
@@ -344,6 +370,13 @@ impl SenderApp {
 
                             ui.label("Systemton übertragen");
                             ui.checkbox(&mut self.config.audio_enabled, "aktiv");
+                            ui.end_row();
+
+                            ui.label("Bedienung übertragen");
+                            ui.checkbox(
+                                &mut self.config.control_enabled,
+                                "Touch und Tesla-Tastatur aktiv",
+                            );
                             ui.end_row();
                         });
 
@@ -524,10 +557,15 @@ impl eframe::App for SenderApp {
                 .unwrap_or_else(|| "Kein Bildschirm".to_owned());
             ui.label(format!("Bildschirm: {selected_monitor}"));
             ui.label(format!(
-                "max. {} FPS · {} kbit/s · Ton {} · {}",
+                "max. {} FPS · {} kbit/s · Ton {} · Bedienung {} · {}",
                 self.config.fps,
                 self.config.bitrate_kbps,
                 if self.config.audio_enabled { "an" } else { "aus" },
+                if self.config.control_enabled {
+                    "an"
+                } else {
+                    "aus"
+                },
                 if self.config.https_enabled {
                     format!("HTTPS ({})", self.config.https_domain)
                 } else {

@@ -7,6 +7,7 @@ Die Anwendung enthält alles in einem Prozess:
 - vollständige Windows-GUI mit Monitorauswahl
 - Windows Graphics Capture
 - WASAPI-Loopback-Aufnahme des Windows-Systemtons mit gemeinsamer A/V-Zeitbasis
+- optionaler Rückkanal für native Windows-Touchbedienung und Tesla-Bildschirmtastatur
 - H.264-Encoding mit OpenH264
 - lokalen HTTP-/WebSocket-Server
 - PIN-Anmeldung
@@ -41,6 +42,7 @@ cargo build --release
 
 1. `build\release\tesla-screen-sender.exe` starten.
 2. Über „Einstellungen“ Bildschirm, Port, Bildrate, Bitrate, PIN und Systemton auswählen.
+   Dort kann „Bedienung übertragen“ separat ein- oder ausgeschaltet werden; die sichere Vorgabe ist aus.
 3. „Stream starten“ drücken.
 4. Den Firewallzugriff für private Netzwerke erlauben.
 5. Die in der App angezeigte Adresse im Tesla-Browser öffnen.

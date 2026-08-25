@@ -7,6 +7,8 @@ const canvas = document.querySelector("#screen");
 const status = document.querySelector("#status");
 const fullscreenButton = document.querySelector("#fullscreen");
 const audioEnableButton = document.querySelector("#audio-enable");
+const controlState = document.querySelector("#control-state");
+const remoteKeyboard = document.querySelector("#remote-keyboard");
 const modeNote = document.querySelector("#mode-note");
 const context = canvas.getContext("2d", { alpha: false, desynchronized: true });
 const hasWebCodecs = "VideoDecoder" in window && "EncodedVideoChunk" in window;
@@ -32,6 +34,15 @@ let audioAnchorTimestamp = null;
 let audioAnchorTime = 0;
 let nextAudioTime = 0;
 const scheduledAudioSources = new Set();
+const activePointers = new Map();
+const KEYBOARD_SENTINEL = "\u200b";
+let controlEnabled = false;
+let keyboardCandidate = false;
+let keyboardConfirmed = false;
+let focusedRemoteRect = null;
+let composingText = false;
+let ignoreNextKeyboardInput = false;
+let keyboardShiftPx = 0;
 
 function showStatus(message, connected = false) {
   status.textContent = message;
@@ -291,6 +302,178 @@ function queueJpeg(frame) {
   })();
 }
 
+function sendRemote(message) {
+  if (!controlEnabled || !socket || socket.readyState !== WebSocket.OPEN) return false;
+  socket.send(JSON.stringify(message));
+  return true;
+}
+
+function setControlEnabled(enabled) {
+  controlEnabled = Boolean(enabled);
+  controlState.hidden = !controlEnabled;
+  canvas.classList.toggle("interactive", controlEnabled);
+  if (!controlEnabled) {
+    activePointers.clear();
+    dismissRemoteKeyboard();
+  }
+}
+
+function resetKeyboardBuffer() {
+  remoteKeyboard.value = KEYBOARD_SENTINEL;
+  try {
+    remoteKeyboard.setSelectionRange(KEYBOARD_SENTINEL.length, KEYBOARD_SENTINEL.length);
+  } catch {
+    // Some vehicle browsers do not expose selection APIs for tiny hidden fields.
+  }
+}
+
+function armRemoteKeyboard() {
+  if (!controlEnabled) return;
+  keyboardCandidate = true;
+  resetKeyboardBuffer();
+  try {
+    remoteKeyboard.focus({ preventScroll: true });
+  } catch {
+    remoteKeyboard.focus();
+  }
+  try {
+    navigator.virtualKeyboard?.show();
+  } catch {
+    // Focusing the textarea is the broadly supported keyboard trigger.
+  }
+}
+
+function confirmRemoteKeyboard(rect) {
+  keyboardCandidate = true;
+  keyboardConfirmed = true;
+  focusedRemoteRect = rect || null;
+  if (document.activeElement !== remoteKeyboard) armRemoteKeyboard();
+  updateKeyboardShift();
+}
+
+function dismissRemoteKeyboard() {
+  keyboardCandidate = false;
+  keyboardConfirmed = false;
+  focusedRemoteRect = null;
+  keyboardShiftPx = 0;
+  viewer.style.setProperty("--keyboard-shift", "0px");
+  if (document.activeElement === remoteKeyboard) remoteKeyboard.blur();
+  try {
+    navigator.virtualKeyboard?.hide();
+  } catch {
+    // blur() is sufficient on browsers without the Virtual Keyboard API.
+  }
+}
+
+function updateKeyboardShift() {
+  if (!keyboardConfirmed || !focusedRemoteRect || canvas.width === 0 || canvas.height === 0) {
+    keyboardShiftPx = 0;
+    viewer.style.setProperty("--keyboard-shift", "0px");
+    return;
+  }
+  const viewport = window.visualViewport;
+  const availableTop = viewport?.offsetTop || 0;
+  const availableBottom = availableTop + (viewport?.height || window.innerHeight);
+  const canvasRect = canvas.getBoundingClientRect();
+  const scale = Math.min(canvasRect.width / canvas.width, canvasRect.height / canvas.height);
+  const contentHeight = canvas.height * scale;
+  const contentTop = canvasRect.top - keyboardShiftPx + (canvasRect.height - contentHeight) / 2;
+  const focusTop = contentTop + focusedRemoteRect.top * contentHeight;
+  const focusBottom = contentTop + focusedRemoteRect.bottom * contentHeight;
+  const desiredShift = Math.min(0, availableBottom - 28 - focusBottom);
+  const minimumShift = availableTop + 20 - focusTop;
+  const shift = Math.round(Math.max(desiredShift, minimumShift));
+  keyboardShiftPx = shift;
+  viewer.style.setProperty("--keyboard-shift", `${shift}px`);
+}
+
+function handleControlMessage(message) {
+  if (message.type === "control") {
+    setControlEnabled(message.enabled);
+    return;
+  }
+  if (message.type === "keyboard") {
+    if (message.show) confirmRemoteKeyboard(message.rect);
+    else dismissRemoteKeyboard();
+  }
+}
+
+function canvasCoordinates(event, clampOutside = false) {
+  if (!canvas.width || !canvas.height) return null;
+  const rect = canvas.getBoundingClientRect();
+  const scale = Math.min(rect.width / canvas.width, rect.height / canvas.height);
+  const contentWidth = canvas.width * scale;
+  const contentHeight = canvas.height * scale;
+  const left = rect.left + (rect.width - contentWidth) / 2;
+  const top = rect.top + (rect.height - contentHeight) / 2;
+  let x = (event.clientX - left) / contentWidth;
+  let y = (event.clientY - top) / contentHeight;
+  if (!clampOutside && (x < 0 || x > 1 || y < 0 || y > 1)) return null;
+  x = Math.max(0, Math.min(1, x));
+  y = Math.max(0, Math.min(1, y));
+  return { x, y };
+}
+
+function pointerRemoteId(pointerId) {
+  return Math.abs(Number(pointerId) % 999_999) + 1;
+}
+
+function handlePointerDown(event) {
+  if (!controlEnabled || (event.pointerType === "mouse" && event.button !== 0)) return;
+  const point = canvasCoordinates(event);
+  if (!point) return;
+  event.preventDefault();
+  try {
+    canvas.setPointerCapture(event.pointerId);
+  } catch {
+    // Pointer capture is optional; document-level pointer events still complete the contact.
+  }
+  const pointer = {
+    id: pointerRemoteId(event.pointerId),
+    x: point.x,
+    y: point.y,
+    startX: event.clientX,
+    startY: event.clientY,
+    moved: false,
+  };
+  activePointers.set(event.pointerId, pointer);
+  sendRemote({ type: "touch", phase: "down", id: pointer.id, x: point.x, y: point.y });
+}
+
+function handlePointerMove(event) {
+  const pointer = activePointers.get(event.pointerId);
+  if (!pointer) return;
+  event.preventDefault();
+  const point = canvasCoordinates(event, true);
+  if (!point) return;
+  pointer.x = point.x;
+  pointer.y = point.y;
+  if (Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) > 9) {
+    pointer.moved = true;
+  }
+  sendRemote({ type: "touch", phase: "move", id: pointer.id, x: point.x, y: point.y });
+}
+
+function finishPointer(event, canceled) {
+  const pointer = activePointers.get(event.pointerId);
+  if (!pointer) return;
+  event.preventDefault();
+  const point = canvasCoordinates(event, true);
+  if (point) {
+    pointer.x = point.x;
+    pointer.y = point.y;
+  }
+  sendRemote({
+    type: "touch",
+    phase: canceled ? "cancel" : "up",
+    id: pointer.id,
+    x: pointer.x,
+    y: pointer.y,
+  });
+  activePointers.delete(event.pointerId);
+  if (!canceled && !pointer.moved) armRemoteKeyboard();
+}
+
 function connect() {
   clearTimeout(reconnectTimer);
   if (socket && (socket.readyState === WebSocket.CONNECTING || socket.readyState === WebSocket.OPEN)) {
@@ -312,6 +495,14 @@ function connect() {
   };
   currentSocket.onmessage = (event) => {
     if (socket !== currentSocket) return;
+    if (typeof event.data === "string") {
+      try {
+        handleControlMessage(JSON.parse(event.data));
+      } catch (error) {
+        console.warn("Invalid control message", error);
+      }
+      return;
+    }
     const frame = parseFrame(event.data);
     if (!frame) return;
     if (frame.format === "pcm") {
@@ -350,6 +541,7 @@ function connect() {
   currentSocket.onclose = (event) => {
     if (socket !== currentSocket) return;
     resetMediaClock();
+    setControlEnabled(false);
     if (decoder && decoder.state !== "closed") decoder.close();
     decoder = null;
     waitingForKeyframe = true;
@@ -423,6 +615,106 @@ fullscreenButton.addEventListener("click", async () => {
 audioEnableButton.addEventListener("click", () => {
   void ensureAudioContext();
 });
+
+canvas.addEventListener("pointerdown", handlePointerDown, { passive: false });
+canvas.addEventListener("pointermove", handlePointerMove, { passive: false });
+canvas.addEventListener("pointerup", (event) => finishPointer(event, false), { passive: false });
+canvas.addEventListener("pointercancel", (event) => finishPointer(event, true), { passive: false });
+canvas.addEventListener("lostpointercapture", (event) => {
+  if (activePointers.has(event.pointerId)) finishPointer(event, true);
+});
+canvas.addEventListener("contextmenu", (event) => event.preventDefault());
+canvas.addEventListener("dragstart", (event) => event.preventDefault());
+canvas.addEventListener("selectstart", (event) => event.preventDefault());
+
+setInterval(() => {
+  for (const pointer of activePointers.values()) {
+    sendRemote({
+      type: "touch",
+      phase: "move",
+      id: pointer.id,
+      x: pointer.x,
+      y: pointer.y,
+    });
+  }
+}, 100);
+
+remoteKeyboard.addEventListener("beforeinput", (event) => {
+  if (!controlEnabled || (!keyboardCandidate && !keyboardConfirmed)) return;
+  const deleteKeys = {
+    deleteContentBackward: "backspace",
+    deleteWordBackward: "backspace",
+    deleteSoftLineBackward: "backspace",
+    deleteHardLineBackward: "backspace",
+    deleteContentForward: "delete",
+    deleteWordForward: "delete",
+    deleteSoftLineForward: "delete",
+    deleteHardLineForward: "delete",
+  };
+  const deleteKey = deleteKeys[event.inputType];
+  if (deleteKey) {
+    event.preventDefault();
+    sendRemote({ type: "key", key: deleteKey });
+    resetKeyboardBuffer();
+    return;
+  }
+  if (event.inputType === "insertLineBreak" || event.inputType === "insertParagraph") {
+    event.preventDefault();
+    sendRemote({ type: "key", key: "enter" });
+    resetKeyboardBuffer();
+  }
+});
+
+remoteKeyboard.addEventListener("input", (event) => {
+  if (!controlEnabled || composingText || event.isComposing) return;
+  if (ignoreNextKeyboardInput) {
+    ignoreNextKeyboardInput = false;
+    resetKeyboardBuffer();
+    return;
+  }
+  const text = remoteKeyboard.value.split(KEYBOARD_SENTINEL).join("");
+  if (text) sendRemote({ type: "text", text });
+  resetKeyboardBuffer();
+});
+
+remoteKeyboard.addEventListener("compositionstart", () => {
+  composingText = true;
+});
+
+remoteKeyboard.addEventListener("compositionend", (event) => {
+  composingText = false;
+  if (event.data) sendRemote({ type: "text", text: event.data });
+  ignoreNextKeyboardInput = true;
+  resetKeyboardBuffer();
+  setTimeout(() => {
+    ignoreNextKeyboardInput = false;
+  }, 0);
+});
+
+remoteKeyboard.addEventListener("keydown", (event) => {
+  const keys = {
+    Backspace: "backspace",
+    Delete: "delete",
+    Enter: "enter",
+    Tab: "tab",
+    Escape: "escape",
+    ArrowLeft: "arrow_left",
+    ArrowRight: "arrow_right",
+    ArrowUp: "arrow_up",
+    ArrowDown: "arrow_down",
+    Home: "home",
+    End: "end",
+  };
+  const key = keys[event.key];
+  if (!key) return;
+  event.preventDefault();
+  sendRemote({ type: "key", key });
+  resetKeyboardBuffer();
+});
+
+window.addEventListener("resize", updateKeyboardShift);
+window.visualViewport?.addEventListener("resize", updateKeyboardShift);
+window.visualViewport?.addEventListener("scroll", updateKeyboardShift);
 
 if (!hasWebCodecs) {
   modeNote.hidden = false;
